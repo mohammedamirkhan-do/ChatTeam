@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query, getOne } from '../../database/db.js';
+import { findOne, insertOne, updateOne, deleteOne, find, count } from '../../database/db.js';
 import { requireAuth } from '../../common/auth.js';
 import { hasPermission } from '../workspaces/permissions.js';
 import { requireChannel } from '../channels/service.js';
@@ -38,28 +38,24 @@ messagesRouter.post('/channels/:id/messages', requireAuth, requireChannel, async
     if (req.channel.is_archived) return res.status(403).json({ error: { code: 'ARCHIVED', message: 'Channel is archived' } });
     const { content, parentMessageId, mentions, attachmentIds } = validate(messageCreateSchema, req.body);
     if (parentMessageId) {
-      const parent = await getOne('SELECT id, channel_id FROM messages WHERE id = $1 AND deleted_at IS NULL', [parentMessageId]);
+      const parent = await findOne('messages', { id: parentMessageId, deleted_at: null });
       if (!parent || parent.channel_id !== req.channel.id) {
         return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Parent message not in this channel' } });
       }
     }
-    const msg = await getOne(
-      `INSERT INTO messages(workspace_id, channel_id, sender_id, parent_message_id, content)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [req.channel.workspace_id, req.channel.id, req.user.id, parentMessageId || null, content]
-    );
+    const msg = await insertOne('messages', { workspace_id: req.channel.workspace_id, channel_id: req.channel.id, sender_id: req.user.id, parent_message_id: parentMessageId || null, content });
     const emailIds = await resolveMentionEmails(req.channel.workspace_id, content);
     const validIds = await filterWorkspaceMembers(req.channel.workspace_id, mentions);
     const all = [...new Set([...emailIds, ...validIds])].filter((id) => id !== req.user.id);
     for (const uid of all) {
-      await query('INSERT INTO message_mentions(message_id, mentioned_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [msg.id, uid]);
+      await insertOne('message_mentions', { message_id: msg.id, mentioned_user_id: uid });
     }
     // Link sender-owned, unattached files from this workspace (Slack attach flow).
     for (const fid of [...new Set(attachmentIds)]) {
-      const f = await getOne('SELECT * FROM files WHERE id = $1 AND uploader_id = $2 AND workspace_id = $3 AND message_id IS NULL', [fid, req.user.id, req.channel.workspace_id]);
+      const f = await findOne('files', { id: fid, uploader_id: req.user.id, workspace_id: req.channel.workspace_id, message_id: null });
       if (!f) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Unknown or already-attached file' } });
-      await query('UPDATE files SET message_id = $1 WHERE id = $2', [msg.id, fid]);
-      await query('INSERT INTO message_attachments(message_id, file_id, filename, mime_type, size, url, thumb_url, width, height) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)', [msg.id, f.id, f.filename, f.mime_type, f.size, `/files/${f.id}`, f.thumb_storage_key ? `/files/${f.id}/thumb` : '', f.width, f.height]);
+      await updateOne('files', { id: fid }, { $set: { message_id: msg.id } });
+      await insertOne('message_attachments', { message_id: msg.id, file_id: f.id, filename: f.filename, mime_type: f.mime_type, size: f.size, url: `/files/${f.id}`, thumb_url: f.thumb_storage_key ? `/files/${f.id}/thumb` : '', width: f.width, height: f.height });
     }
     const full = await getMessage(msg.id);
     const attachments = await loadAttachments([msg.id]);
@@ -81,7 +77,7 @@ messagesRouter.post('/channels/:id/messages', requireAuth, requireChannel, async
       await notifyUser(uid, req.channel.workspace_id, 'mention', msg.id);
     }
     if (parentMessageId) {
-      const parent = await getOne('SELECT sender_id FROM messages WHERE id = $1', [parentMessageId]);
+      const parent = await findOne('messages', { id: parentMessageId });
       if (parent && parent.sender_id !== req.user.id && !all.includes(parent.sender_id)) {
         await notifyUser(parent.sender_id, req.channel.workspace_id, 'thread_reply', msg.id);
       }
@@ -96,27 +92,23 @@ messagesRouter.post('/channels/:id/messages', requireAuth, requireChannel, async
 messagesRouter.get('/channels/:id/messages', requireAuth, requireChannel, async (req, res, next) => {
   try {
     const { limit, before } = validate(messagesQuerySchema, req.query);
-    let cursorClause = '';
-    const params = [req.channel.id];
+    const filter = { channel_id: req.channel.id, parent_message_id: null };
     if (before) {
-      const cursor = await getOne('SELECT created_at, id FROM messages WHERE id = $1 AND channel_id = $2', [before, req.channel.id]);
+      const cursor = await findOne('messages', { id: before, channel_id: req.channel.id });
       if (!cursor) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Unknown cursor' } });
-      params.push(cursor.created_at, cursor.id);
-      cursorClause = `AND (m.created_at, m.id) < ($${params.length - 1}, $${params.length})`;
+      filter.$or = [
+        { created_at: { $lt: cursor.created_at } },
+        { created_at: cursor.created_at, id: { $lt: cursor.id } }
+      ];
     }
-    params.push(limit + 1);
-    const base = `
-      SELECT m.*, u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-        (SELECT COUNT(*) FROM messages r WHERE r.parent_message_id = m.id AND r.deleted_at IS NULL) AS reply_count,
-        (SELECT COUNT(*) FROM message_edits e WHERE e.message_id = m.id) AS edit_count
-      FROM messages m JOIN users u ON u.id = m.sender_id
-      WHERE m.channel_id = $1 AND m.parent_message_id IS NULL ${cursorClause}
-      ORDER BY m.created_at DESC, m.id DESC LIMIT $${params.length}`;
-    const r = await query(base, params);
-    const hasMore = r.rows.length > limit;
-    const page = (hasMore ? r.rows.slice(0, limit) : r.rows).reverse();
+    const msgs = await find('messages', filter, { sort: { created_at: -1, id: -1 }, limit: limit + 1 });
+    const hasMore = msgs.length > limit;
+    const page = (hasMore ? msgs.slice(0, limit) : msgs).reverse();
     const ids = page.map((m) => m.id);
     const [reactions, mentions, attachments] = await Promise.all([loadReactions(ids, req.user.id), loadMentions(ids), loadAttachments(ids)]);
+    for (const m of page) {
+      m.reply_count = await count('messages', { parent_message_id: m.id, deleted_at: null });
+    }
     res.json({
       messages: await withButtons(page.map((m) => serializeMessage(m, { reactions, mentionIds: mentions[m.id] || [], attachments }))),
       nextCursor: hasMore ? page[0].id : null,
@@ -133,14 +125,8 @@ messagesRouter.get('/messages/:id/thread', requireAuth, async (req, res, next) =
     const rootId = message.parent_message_id || message.id;
     const root = message.parent_message_id ? await getMessage(rootId) : message;
     if (!root) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Thread root not found' } });
-    const r = await query(
-      `SELECT m.*, u.display_name AS sender_name, u.avatar_url AS sender_avatar, 0 AS reply_count,
-        (SELECT COUNT(*) FROM message_edits e WHERE e.message_id = m.id) AS edit_count
-       FROM messages m JOIN users u ON u.id = m.sender_id
-       WHERE m.parent_message_id = $1 ORDER BY m.created_at ASC, m.id ASC`,
-      [rootId]
-    );
-    const all = [root, ...r.rows];
+    const rows = await find('messages', { parent_message_id: rootId }, { sort: { created_at: 1 } });
+    const all = [root, ...rows];
     const ids = all.map((m) => m.id);
     const [reactions, mentions, attachments] = await Promise.all([loadReactions(ids, req.user.id), loadMentions(ids), loadAttachments(ids)]);
     const home = dm ? dm.id : null;
@@ -170,8 +156,9 @@ messagesRouter.patch('/messages/:id', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: { code: 'EDIT_WINDOW', message: 'Edit window (24h) expired' } });
     }
     const { content } = validate(messagePatchSchema, req.body);
-    await query('INSERT INTO message_edits(message_id, content) VALUES ($1,$2)', [message.id, message.content]);
-    const updated = await getOne('UPDATE messages SET content = $1, updated_at = now() WHERE id = $2 RETURNING *', [content, message.id]);
+    await insertOne('message_edits', { message_id: message.id, content: message.content });
+    await updateOne('messages', { id: message.id }, { $set: { content, updated_at: new Date() } });
+    const updated = await findOne('messages', { id: message.id });
     const full = await getMessage(updated.id);
     const [reactions, mentions, attachments] = await Promise.all([loadReactions([full.id], req.user.id), loadMentions([full.id]), loadAttachments([full.id])]);
     const base = serializeMessage(full, { reactions, mentionIds: mentions[full.id] || [], attachments });
@@ -198,7 +185,7 @@ messagesRouter.delete('/messages/:id', requireAuth, async (req, res, next) => {
     if (!isAuthor && !canMod) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot delete this message' } });
     }
-    await query('UPDATE messages SET deleted_at = now() WHERE id = $1', [message.id]);
+    await updateOne('messages', { id: message.id }, { $set: { deleted_at: new Date() } });
     const full = await getMessage(message.id);
     if (dm) {
       await publish({ type: 'dm.message.deleted', payload: { id: message.id, dmId: dm.id } }, [`dm:${dm.id}`]);
@@ -218,7 +205,8 @@ messagesRouter.post('/messages/:id/reactions', requireAuth, async (req, res, nex
     if (dm) {
       if (message.deleted_at) return res.status(403).json({ error: { code: 'DELETED', message: 'Message is deleted' } });
       const { emoji } = validate(reactionSchema, req.body);
-      await query('INSERT INTO message_reactions(message_id, user_id, emoji) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [message.id, req.user.id, emoji]);
+      const dmExisting = await findOne('message_reactions', { message_id: message.id, user_id: req.user.id, emoji });
+      if (!dmExisting) await insertOne('message_reactions', { message_id: message.id, user_id: req.user.id, emoji });
       const reactions = await loadReactions([message.id], req.user.id);
       const full = await getMessage(message.id);
       const out = { ...serializeMessage(full, { reactions, attachments: await loadAttachments([message.id]) }), channelId: null, dmConversationId: dm.id };
@@ -229,7 +217,8 @@ messagesRouter.post('/messages/:id/reactions', requireAuth, async (req, res, nex
     if (channel.is_archived) return res.status(403).json({ error: { code: 'ARCHIVED', message: 'Channel is archived' } });
     if (message.deleted_at) return res.status(403).json({ error: { code: 'DELETED', message: 'Message is deleted' } });
     const { emoji } = validate(reactionSchema, req.body);
-    await query('INSERT INTO message_reactions(message_id, user_id, emoji) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [message.id, req.user.id, emoji]);
+    const existing = await findOne('message_reactions', { message_id: message.id, user_id: req.user.id, emoji });
+    if (!existing) await insertOne('message_reactions', { message_id: message.id, user_id: req.user.id, emoji });
     const reactions = await loadReactions([message.id], req.user.id);
     const full = await getMessage(message.id);
     await publish({ type: 'reaction.added', payload: { messageId: message.id, channelId: channel.id, emoji, userId: req.user.id } }, [`channel:${channel.id}`]);
@@ -245,7 +234,7 @@ messagesRouter.delete('/messages/:id/reactions', requireAuth, async (req, res, n
     const { message, chRole, dm } = await accessMessage(req.params.id, req.user.id);
     if (dm) {
       const { emoji } = validate(reactionSchema, req.query);
-      await query('DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3', [message.id, req.user.id, emoji]);
+      await deleteOne('message_reactions', { message_id: message.id, user_id: req.user.id, emoji });
       const reactions = await loadReactions([message.id], req.user.id);
       const full = await getMessage(message.id);
       const out = { ...serializeMessage(full, { reactions, attachments: await loadAttachments([message.id]) }), channelId: null, dmConversationId: dm.id };
@@ -254,7 +243,7 @@ messagesRouter.delete('/messages/:id/reactions', requireAuth, async (req, res, n
     }
     if (!chRole) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Join the channel first' } });
     const { emoji } = validate(reactionSchema, req.query);
-    await query('DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3', [message.id, req.user.id, emoji]);
+    await deleteOne('message_reactions', { message_id: message.id, user_id: req.user.id, emoji });
     const reactions = await loadReactions([message.id], req.user.id);
     const full = await getMessage(message.id);
     await publish({ type: 'reaction.removed', payload: { messageId: message.id, channelId: message.channel_id, emoji, userId: req.user.id } }, [`channel:${message.channel_id}`]);
@@ -269,15 +258,11 @@ messagesRouter.post('/channels/:id/read', requireAuth, requireChannel, async (re
   try {
     if (!req.channelRole) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Join the channel first' } });
     const { lastReadMessageId } = validate(readSchema, req.body);
-    const msg = await getOne('SELECT id FROM messages WHERE id = $1 AND channel_id = $2', [lastReadMessageId, req.channel.id]);
+    const msg = await findOne('messages', { id: lastReadMessageId, channel_id: req.channel.id });
     if (!msg) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Message not in this channel' } });
     // Mark = now(): everything up to this instant is read. (Using the message's
     // own timestamp would wrongly leave same-millisecond siblings unread.)
-    await query(
-      `UPDATE channel_members SET last_read_at = GREATEST(COALESCE(last_read_at, '-infinity'), now())
-       WHERE channel_id = $1 AND user_id = $2`,
-      [req.channel.id, req.user.id]
-    );
+    await updateOne('channel_members', { channel_id: req.channel.id, user_id: req.user.id }, { $set: { last_read_at: new Date() } });
     res.json({ ok: true });
   } catch (e) {
     next(e);

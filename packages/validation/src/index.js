@@ -37,7 +37,7 @@ export const channelSchema = z.object({
 
 export const messageSchema = z.object({
   content: z.string().min(1).max(8000),
-  parentMessageId: z.string().uuid().nullable().optional(),
+  parentMessageId: z.string().min(1).nullable().optional(),
 });
 
 export function validate(schema, data) {
@@ -92,15 +92,15 @@ export const channelPatchSchema = z.object({
 });
 
 export const channelMemberAddSchema = z.object({
-  userId: z.string().uuid(),
+  userId: z.string().min(1),
 });
 
 // ---- Phase 5: messaging ----
 export const messageCreateSchema = z.object({
   content: z.string().min(1).max(8000),
-  parentMessageId: z.string().uuid().nullable().optional(),
-  mentions: z.array(z.string().uuid()).max(50).optional().default([]),
-  attachmentIds: z.array(z.string().uuid()).max(5).optional().default([]),
+  parentMessageId: z.string().min(1).nullable().optional(),
+  mentions: z.array(z.string().min(1)).max(50).optional().default([]),
+  attachmentIds: z.array(z.string().min(1)).max(5).optional().default([]),
 });
 
 export const messagePatchSchema = z.object({
@@ -112,12 +112,12 @@ export const reactionSchema = z.object({
 });
 
 export const readSchema = z.object({
-  lastReadMessageId: z.string().uuid(),
+  lastReadMessageId: z.string().min(1),
 });
 
 export const messagesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional().default(30),
-  before: z.string().uuid().optional(),
+  before: z.string().min(1).optional(),
 });
 
 // ---- Phase 7: files ----
@@ -133,14 +133,14 @@ export const fileConfirmSchema = z.object({
 });
 
 export const fileShareSchema = z.object({
-  channelId: z.string().uuid(),
+  channelId: z.string().min(1),
   content: z.string().max(8000).optional(),
-  parentMessageId: z.string().uuid().nullable().optional(),
+  parentMessageId: z.string().min(1).nullable().optional(),
 });
 
 // ---- Phase 9: direct messages ----
 export const dmCreateSchema = z.object({
-  userIds: z.array(z.string().uuid()).min(1).max(20),
+  userIds: z.array(z.string().min(1)).min(1).max(20),
   name: z.string().min(1).max(80).optional(),
 });
 
@@ -149,30 +149,30 @@ export const dmPatchSchema = z.object({
 });
 
 export const dmMemberAddSchema = z.object({
-  userId: z.string().uuid(),
+  userId: z.string().min(1),
 });
 
 export const dmMessageCreateSchema = z.object({
   content: z.string().min(1).max(8000),
-  parentMessageId: z.string().uuid().nullable().optional(),
-  mentions: z.array(z.string().uuid()).max(50).optional().default([]),
-  attachmentIds: z.array(z.string().uuid()).max(5).optional().default([]),
+  parentMessageId: z.string().min(1).nullable().optional(),
+  mentions: z.array(z.string().min(1)).max(50).optional().default([]),
+  attachmentIds: z.array(z.string().min(1)).max(5).optional().default([]),
 });
 
 export const dmReadSchema = z.object({
-  lastReadMessageId: z.string().uuid(),
+  lastReadMessageId: z.string().min(1),
 });
 
 export const dmMessagesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional().default(30),
-  before: z.string().uuid().optional(),
+  before: z.string().min(1).optional(),
 });
 
 // ---- Phase 11: advanced ----
 // A. Calls
 export const callCreateSchema = z.object({
-  channelId: z.string().uuid().nullable().optional(),
-  dmConversationId: z.string().uuid().nullable().optional(),
+  channelId: z.string().min(1).nullable().optional(),
+  dmConversationId: z.string().min(1).nullable().optional(),
 });
 export const callMediaSchema = z.object({
   muted: z.boolean().optional(),
@@ -182,11 +182,11 @@ export const callMediaSchema = z.object({
 // B. Canvas
 export const canvasCreateSchema = z.object({
   title: z.string().min(1).max(200).optional().default('Untitled canvas'),
-  channelId: z.string().uuid().nullable().optional(),
+  channelId: z.string().min(1).nullable().optional(),
 });
 export const canvasPatchSchema = z.object({ title: z.string().min(1).max(200) });
 export const canvasBlockSchema = z.object({
-  id: z.string().uuid().optional(),
+  id: z.string().min(1).optional(),
   kind: z.enum(['paragraph', 'heading', 'checklist', 'code', 'image', 'table']).optional().default('paragraph'),
   content: z.string().max(20000).optional().default(''),
   data: z.record(z.unknown()).optional().default({}),
@@ -197,7 +197,7 @@ export const canvasBlockSchema = z.object({
 export const canvasBlocksSchema = z.object({ blocks: z.array(canvasBlockSchema).max(200) });
 export const canvasCommentSchema = z.object({
   content: z.string().min(1).max(4000),
-  blockId: z.string().uuid().nullable().optional(),
+  blockId: z.string().min(1).nullable().optional(),
 });
 // C. Bots
 export const botCreateSchema = z.object({ name: z.string().min(1).max(80) });
@@ -208,19 +208,19 @@ export const botCommandSchema = z.object({
   buttons: z.array(z.object({ id: z.string().min(1).max(80), label: z.string().min(1).max(80) })).max(5).optional().default([]),
 });
 export const botMessageSchema = z.object({
-  channelId: z.string().uuid().nullable().optional(),
-  dmConversationId: z.string().uuid().nullable().optional(),
+  channelId: z.string().min(1).nullable().optional(),
+  dmConversationId: z.string().min(1).nullable().optional(),
   content: z.string().min(1).max(8000),
 });
 export const botCallbackSchema = z.object({
-  messageId: z.string().uuid(),
+  messageId: z.string().min(1),
   action: z.string().min(1).max(80),
 });
 // D. Integrations
 export const integrationCreateSchema = z.object({
   name: z.string().min(1).max(80),
   provider: z.string().max(40).optional().default('custom'),
-  channelId: z.string().uuid().nullable().optional(),
+  channelId: z.string().min(1).nullable().optional(),
 });
 export const subscriptionSchema = z.object({
   url: z.string().url().max(500),
@@ -237,7 +237,7 @@ export const workflowRunSchema = z.object({ inputs: z.record(z.unknown()).option
 export const onboardingSchema = z.object({
   newUserEmail: z.string().email().max(255),
   channelName: z.string().min(1).max(40).regex(/^[a-z0-9-_]+$/).optional().default('onboarding'),
-  hrUserId: z.string().uuid().nullable().optional(),
+  hrUserId: z.string().min(1).nullable().optional(),
 });
 
 // ---- Phase 8: search ----
@@ -245,7 +245,7 @@ export const searchTypeSchema = z.enum(['messages', 'users', 'channels', 'files'
 
 export const searchQuerySchema = z.object({
   q: z.string().min(1).max(500),
-  workspaceId: z.string().uuid(),
+  workspaceId: z.string().min(1),
   type: searchTypeSchema.optional().default('all'),
   limit: z.coerce.number().int().min(1).max(50).optional().default(20),
   cursor: z.string().max(64).optional(),

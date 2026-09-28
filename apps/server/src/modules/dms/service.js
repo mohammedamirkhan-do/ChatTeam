@@ -1,9 +1,5 @@
-import { getOne, query } from '../../database/db.js';
+import { findOne, aggregate } from '../../database/db.js';
 import { serializeMessage, getMessage } from '../messages/service.js';
-
-// Shared DM helpers. DM messages live in `messages` with channel_id NULL +
-// dm_conversation_id set (see 010_dms.sql); threads/reactions/mentions/
-// attachments loaders all key on message id so they work unchanged.
 
 export function publicDM(row, extra = {}) {
   const memberIds = row.member_ids || [];
@@ -21,24 +17,21 @@ export function publicDM(row, extra = {}) {
   };
 }
 
-// Enrich a serialized channel-style message with its DM home.
 export function withDmHome(serialized, dmId) {
   return { ...serialized, channelId: null, dmConversationId: dmId };
 }
 
 export async function getDmConversation(id) {
-  return getOne('SELECT * FROM direct_conversations WHERE id = $1', [id]);
+  return findOne('direct_conversations', { id: id });
 }
 
-// Membership gate: caller must be a workspace member AND a DM member.
-// Attaches req.dm (+ member row). Non-members get 403/404 (Slack hides).
 export async function requireDm(req, res, next) {
   try {
     const dm = await getDmConversation(req.params.id);
     if (!dm) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
-    const wsMember = await getOne('SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [dm.workspace_id, req.user.id]);
+    const wsMember = await findOne('workspace_members', { workspace_id: dm.workspace_id, user_id: req.user.id });
     if (!wsMember) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not a workspace member' } });
-    const member = await getOne('SELECT * FROM direct_conversation_members WHERE conversation_id = $1 AND user_id = $2', [dm.id, req.user.id]);
+    const member = await findOne('direct_conversation_members', { conversation_id: dm.id, user_id: req.user.id });
     if (!member) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
     req.dm = dm;
     req.dmMember = member;
@@ -48,41 +41,37 @@ export async function requireDm(req, res, next) {
   }
 }
 
-// DM access for a message id (mirrors accessMessage for channels).
 export async function accessDmMessage(messageId, userId) {
   const message = await getMessage(messageId);
   if (!message) throw Object.assign(new Error('Message not found'), { status: 404, code: 'NOT_FOUND' });
   if (!message.dm_conversation_id) throw Object.assign(new Error('Not a DM message'), { status: 400, code: 'BAD_REQUEST' });
   const dm = await getDmConversation(message.dm_conversation_id);
-  const wsMember = await getOne('SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [dm.workspace_id, userId]);
+  const wsMember = await findOne('workspace_members', { workspace_id: dm.workspace_id, user_id: userId });
   if (!wsMember) throw Object.assign(new Error('Not a workspace member'), { status: 403, code: 'FORBIDDEN' });
-  const member = await getOne('SELECT * FROM direct_conversation_members WHERE conversation_id = $1 AND user_id = $2', [dm.id, userId]);
+  const member = await findOne('direct_conversation_members', { conversation_id: dm.id, user_id: userId });
   if (!member) throw Object.assign(new Error('Conversation not found'), { status: 404, code: 'NOT_FOUND' });
   return { message, dm };
 }
 
-// Idempotency: exact same non-group member set (order-insensitive) reuses the row.
 export async function findDirectPair(workspaceId, userIds) {
   const sorted = [...new Set(userIds)].sort();
-  const r = await query(
-    `SELECT dc.* FROM direct_conversations dc
-     WHERE dc.workspace_id = $1 AND dc.is_group = false
-       AND (SELECT COUNT(*) FROM direct_conversation_members m WHERE m.conversation_id = dc.id) = $2
-       AND NOT EXISTS (
-         SELECT 1 FROM direct_conversation_members m WHERE m.conversation_id = dc.id AND NOT (m.user_id = ANY($3))
-       )`,
-    [workspaceId, sorted.length, sorted]
-  );
-  return r.rows[0] || null;
+  const r = await aggregate('direct_conversations', [
+    { $match: { workspace_id: workspaceId, is_group: false } },
+    { $lookup: { from: 'direct_conversation_members', localField: '_id', foreignField: 'conversation_id', as: 'members' } },
+    { $addFields: { member_count: { $size: '$members' } } },
+    { $match: { member_count: sorted.length, 'members.user_id': { $all: sorted } } },
+  ]);
+  return r[0] || null;
 }
 
 export async function dmMemberList(dmId) {
-  const r = await query(
-    `SELECT m.*, u.display_name, u.avatar_url, u.email, u.status FROM direct_conversation_members m
-     JOIN users u ON u.id = m.user_id WHERE m.conversation_id = $1 ORDER BY u.display_name`,
-    [dmId]
-  );
-  return r.rows.map((m) => ({
+  const r = await aggregate('direct_conversation_members', [
+    { $match: { conversation_id: dmId } },
+    { $lookup: { from: 'users', localField: 'user_id', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $project: { user_id: '$user_id', display_name: '$user.display_name', avatar_url: '$user.avatar_url', email: '$user.email', status: '$user.status', last_read_at: 1, joined_at: 1 } }
+  ]);
+  return r.map((m) => ({
     userId: m.user_id,
     displayName: m.display_name,
     avatarUrl: m.avatar_url,
@@ -93,7 +82,6 @@ export async function dmMemberList(dmId) {
   }));
 }
 
-// Serialize a DM message row fully (reactions/mentions/attachments/buttons included).
 export async function serializeDmMessage(msgId, meId, dmId) {
   const { loadReactions, loadMentions, loadAttachments, withButtons } = await import('../messages/service.js');
   const full = await getMessage(msgId);

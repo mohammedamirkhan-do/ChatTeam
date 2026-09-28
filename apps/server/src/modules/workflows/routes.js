@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query, getOne } from '../../database/db.js';
+import { findOne, insertOne, updateOne, deleteOne, aggregate, find } from '../../database/db.js';
 import { requireAuth } from '../../common/auth.js';
 import { requireWorkspace, requirePermission } from '../workspaces/permissions.js';
 import { workflowCreateSchema, workflowRunSchema, onboardingSchema, validate } from '@teamchat/validation';
@@ -19,8 +19,8 @@ function publicWorkflow(row, steps = []) {
 }
 
 async function loadSteps(workflowId) {
-  const r = await query('SELECT * FROM workflow_steps WHERE workflow_id = $1 ORDER BY position', [workflowId]);
-  return r.rows.map((s) => ({ id: s.id, kind: s.kind, config: s.config, position: s.position }));
+  const rows = await find('workflow_steps', { workflow_id: workflowId });
+  return rows.map((s) => ({ id: s.id, kind: s.kind, config: s.config, position: s.position }));
 }
 
 // Action executors (Trigger→Condition→Action→Result). Each returns a result entry.
@@ -31,7 +31,7 @@ async function runStep(workspaceId, actorId, step, inputs, prior) {
   switch (step.kind) {
     case 'create_channel': {
       const name = String(sub(cfg.name || 'workflow-channel')).toLowerCase();
-      const exists = await getOne('SELECT id FROM channels WHERE workspace_id = $1 AND name = $2', [workspaceId, name]);
+      const exists = await findOne('channels', { workspace_id: workspaceId, name });
       const ch = exists || await createChannel(workspaceId, actorId, { name, description: String(sub(cfg.description || 'Created by workflow')) });
       await publish({ type: 'channel.created', payload: { channel: ch } }, [`workspace:${workspaceId}`]);
       return { channelId: ch.id || ch };
@@ -39,10 +39,7 @@ async function runStep(workspaceId, actorId, step, inputs, prior) {
     case 'post_message': {
       const channelId = sub(cfg.channelId || prior.channelId);
       if (!channelId) throw Object.assign(new Error('post_message needs channelId'), { status: 400 });
-      const msg = await getOne(
-        `INSERT INTO messages(workspace_id, channel_id, sender_id, content, message_type) VALUES ($1,$2,$3,$4,'bot') RETURNING *`,
-        [workspaceId, channelId, actorId, String(sub(cfg.content || '(workflow message)')).slice(0, 8000)]
-      );
+      const msg = await insertOne('messages', { workspace_id: workspaceId, channel_id: channelId, sender_id: actorId, content: String(sub(cfg.content || '(workflow message)')).slice(0, 8000), message_type: 'bot' });
       const full = await getMessage(msg.id);
       const out = serializeMessage(full);
       await publish({ type: 'message.created', payload: { message: out } }, [`channel:${channelId}`]);
@@ -51,9 +48,9 @@ async function runStep(workspaceId, actorId, step, inputs, prior) {
     case 'invite_user': {
       const email = String(sub(cfg.email || inputs.newUserEmail || '')).toLowerCase();
       if (!email) throw Object.assign(new Error('invite_user needs email'), { status: 400 });
-      const target = await getOne('SELECT id FROM users WHERE lower(email) = $1', [email]);
+      const target = await findOne('users', { email });
       if (!target) return { invited: false, reason: 'no such user yet' };
-      await query('INSERT INTO workspace_members(workspace_id, user_id, role, invited_by) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [workspaceId, target.id, 'member', actorId]);
+      await insertOne('workspace_members', { workspace_id: workspaceId, user_id: target.id, role: 'member', invited_by: actorId });
       return { invited: true, userId: target.id };
     }
     case 'notify_user': {
@@ -68,7 +65,7 @@ async function runStep(workspaceId, actorId, step, inputs, prior) {
 }
 
 export async function runWorkflow(workflowId, actorId, inputs = {}) {
-  const wf = await getOne('SELECT * FROM workflows WHERE id = $1', [workflowId]);
+  const wf = await findOne('workflows', { id: workflowId });
   if (!wf) throw Object.assign(new Error('Workflow not found'), { status: 404 });
   const steps = await loadSteps(workflowId);
   const results = {};
@@ -79,10 +76,10 @@ export async function runWorkflow(workflowId, actorId, inputs = {}) {
       results[step.kind] = r;
       Object.assign(prior, r);
     }
-    const run = await getOne('INSERT INTO workflow_runs(workflow_id, status, result, run_by) VALUES ($1,$2,$3,$4) RETURNING *', [workflowId, 'ok', JSON.stringify(results), actorId]);
+    const run = await insertOne('workflow_runs', { workflow_id: workflowId, status: 'ok', result: JSON.stringify(results), run_by: actorId });
     return { run, results };
   } catch (err) {
-    await getOne('INSERT INTO workflow_runs(workflow_id, status, result, run_by) VALUES ($1,$2,$3,$4) RETURNING *', [workflowId, 'error', JSON.stringify({ error: err.message, partial: results }), actorId]);
+    await insertOne('workflow_runs', { workflow_id: workflowId, status: 'error', result: JSON.stringify({ error: err.message, partial: results }), run_by: actorId });
     throw err;
   }
 }
@@ -91,12 +88,9 @@ export async function runWorkflow(workflowId, actorId, inputs = {}) {
 workflowsRouter.post('/workspaces/:wid/workflows', requireAuth, requireWorkspace, requirePermission('MANAGE_WORKSPACE'), async (req, res, next) => {
   try {
     const input = validate(workflowCreateSchema, req.body);
-    const wf = await getOne(
-      'INSERT INTO workflows(workspace_id, name, description, trigger, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [req.workspace.id, input.name, input.description, JSON.stringify(input.trigger), req.user.id]
-    );
+    const wf = await insertOne('workflows', { workspace_id: req.workspace.id, name: input.name, description: input.description, trigger: JSON.stringify(input.trigger), created_by: req.user.id });
     for (let i = 0; i < input.steps.length; i++) {
-      await query('INSERT INTO workflow_steps(workflow_id, kind, config, position) VALUES ($1,$2,$3,$4)', [wf.id, input.steps[i].kind, JSON.stringify(input.steps[i].config || {}), i]);
+      await insertOne('workflow_steps', { workflow_id: wf.id, kind: input.steps[i].kind, config: JSON.stringify(input.steps[i].config || {}), position: i });
     }
     res.status(201).json({ workflow: publicWorkflow(wf, input.steps) });
   } catch (e) {
@@ -107,9 +101,9 @@ workflowsRouter.post('/workspaces/:wid/workflows', requireAuth, requireWorkspace
 // GET /workspaces/:wid/workflows
 workflowsRouter.get('/workspaces/:wid/workflows', requireAuth, requireWorkspace, async (req, res, next) => {
   try {
-    const r = await query('SELECT * FROM workflows WHERE workspace_id = $1 ORDER BY created_at', [req.workspace.id]);
+    const rows = await find('workflows', { workspace_id: req.workspace.id });
     const out = [];
-    for (const row of r.rows) out.push(publicWorkflow(row, await loadSteps(row.id)));
+    for (const row of rows) out.push(publicWorkflow(row, await loadSteps(row.id)));
     res.json({ workflows: out });
   } catch (e) {
     next(e);
@@ -119,9 +113,9 @@ workflowsRouter.get('/workspaces/:wid/workflows', requireAuth, requireWorkspace,
 // POST /workflows/:id/run {inputs}
 workflowsRouter.post('/workflows/:id/run', requireAuth, async (req, res, next) => {
   try {
-    const wf = await getOne('SELECT * FROM workflows WHERE id = $1', [req.params.id]);
+    const wf = await findOne('workflows', { id: req.params.id });
     if (!wf) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Workflow not found' } });
-    const mem = await getOne('SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [wf.workspace_id, req.user.id]);
+    const mem = await findOne('workspace_members', { workspace_id: wf.workspace_id, user_id: req.user.id });
     if (!mem) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not a workspace member' } });
     const { inputs } = validate(workflowRunSchema, req.body);
     const { run, results } = await runWorkflow(wf.id, req.user.id, inputs);
@@ -137,13 +131,9 @@ workflowsRouter.post('/workflows/templates/onboarding', requireAuth, async (req,
   try {
     const { newUserEmail, channelName, hrUserId } = validate(onboardingSchema, req.body);
     // Template runs in the caller's first workspace (Slack runs it where installed).
-    const mem = await getOne('SELECT workspace_id FROM workspace_members WHERE user_id = $1 ORDER BY joined_at LIMIT 1', [req.user.id]);
+    const mem = await findOne('workspace_members', { user_id: req.user.id });
     if (!mem) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Join a workspace first' } });
-    const wf = await getOne(
-      `INSERT INTO workflows(workspace_id, name, description, trigger, created_by)
-       VALUES ($1,'Employee onboarding','New hire checklist flow', $2, $3) RETURNING *`,
-      [mem.workspace_id, JSON.stringify({ type: 'manual', template: 'onboarding' }), req.user.id]
-    );
+    const wf = await insertOne('workflows', { workspace_id: mem.workspace_id, name: 'Employee onboarding', description: 'New hire checklist flow', trigger: JSON.stringify({ type: 'manual', template: 'onboarding' }), created_by: req.user.id });
     const steps = [
       { kind: 'create_channel', config: { name: channelName, description: `Onboarding for ${newUserEmail}` } },
       { kind: 'post_message', config: { content: `👋 Welcome <${newUserEmail}>! Checklist: 1) say hi 2) read #general 3) set up your profile` } },
@@ -151,7 +141,7 @@ workflowsRouter.post('/workflows/templates/onboarding', requireAuth, async (req,
       ...(hrUserId ? [{ kind: 'notify_user', config: { userId: hrUserId } }] : []),
     ];
     for (let i = 0; i < steps.length; i++) {
-      await query('INSERT INTO workflow_steps(workflow_id, kind, config, position) VALUES ($1,$2,$3,$4)', [wf.id, steps[i].kind, JSON.stringify(steps[i].config), i]);
+      await insertOne('workflow_steps', { workflow_id: wf.id, kind: steps[i].kind, config: JSON.stringify(steps[i].config), position: i });
     }
     const { run, results } = await runWorkflow(wf.id, req.user.id, { newUserEmail, hrUserId });
     res.status(201).json({ workflow: publicWorkflow(wf, steps), run, results });

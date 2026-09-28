@@ -1,9 +1,9 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { findOne, insertOne } from '../src/database/db.js';
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
-const { migrate } = await import('../src/database/migrate.js');
 const { createApp } = await import('../src/app.js');
 const { parseSearchQuery } = await import('../src/modules/search/parser.js');
 
@@ -18,7 +18,6 @@ let devId;
 let vaultId;
 
 before(async () => {
-  await migrate();
   const app = createApp();
   server = app.listen(0);
   await new Promise((r) => server.on('listening', r));
@@ -27,10 +26,10 @@ before(async () => {
 
 after(async () => {
   server?.close();
-  const { pool } = await import('../src/database/pg.js');
+  const { closeMongoDB } = await import('../src/database/pg.js');
   const { redis } = await import('../src/database/redis.js');
   try { await redis.disconnect(); } catch {}
-  await pool.end();
+  await closeMongoDB();
 });
 
 async function api(path, { method = 'GET', body, token } = {}) {
@@ -86,12 +85,8 @@ test('setup: users + workspace + public/private channels + messages', async () =
   await api(`/channels/${vaultId}/messages`, { method: 'POST', token: tok.A.token, body: { content: 'vault secret token alpha bravo' } });
 
   // Simulate a file attachment without S3: message_attachments row only.
-  const { pool } = await import('../src/database/pg.js');
-  const msg = await pool.query(`SELECT id FROM messages WHERE channel_id = $1 AND content LIKE '%timeout%' LIMIT 1`, [devId]);
-  await pool.query(
-    `INSERT INTO message_attachments(message_id, file_id, filename, mime_type, size, url) VALUES ($1, gen_random_uuid(), 'timeout.log', 'text/plain', 12, '/files/fake')`,
-    [msg.rows[0].id]
-  );
+  const msg = await findOne('messages', { channel_id: devId, content: { $regex: 'timeout', $options: 'i' } });
+  await insertOne('message_attachments', { message_id: msg.id, file_id: crypto.randomUUID(), filename: 'timeout.log', mime_type: 'text/plain', size: 12, url: '/files/fake' });
 });
 
 async function search(q, token, extra = '') {

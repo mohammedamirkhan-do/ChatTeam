@@ -4,7 +4,6 @@ import { createServer } from 'node:http';
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
-const { migrate } = await import('../src/database/migrate.js');
 const { createApp } = await import('../src/app.js');
 
 let base;
@@ -36,7 +35,6 @@ let captureServer;
 let captureBase;
 
 before(async () => {
-  await migrate();
   const app = createApp();
   server = app.listen(0);
   await new Promise((r) => server.on('listening', r));
@@ -69,10 +67,10 @@ before(async () => {
 after(async () => {
   captureServer?.close();
   server?.close();
-  const { pool } = await import('../src/database/pg.js');
+  const { closeMongoDB } = await import('../src/database/pg.js');
   const { redis } = await import('../src/database/redis.js');
   try { await redis.disconnect(); } catch {}
-  await pool.end();
+  await closeMongoDB();
 });
 
 test('create integration returns webhook URL (admin-gated)', async () => {

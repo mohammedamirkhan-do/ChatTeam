@@ -1,15 +1,12 @@
 import { Router } from 'express';
-import { query } from '../../database/db.js';
+import { findOne, insertOne, find, aggregate, count, updateOne } from '../../database/db.js';
 import { requireAuth } from '../../common/auth.js';
 import { publish } from '../../websocket/index.js';
 
 export const notificationsRouter = Router();
 
 export async function notifyUser(userId, workspaceId, type, refId) {
-  const n = await query(
-    'INSERT INTO notifications(user_id, workspace_id, type, ref_id) VALUES ($1,$2,$3,$4) RETURNING *',
-    [userId, workspaceId, type, refId || null]
-  ).then((r) => r.rows[0]);
+  const n = await insertOne('notifications', { user_id: userId, workspace_id: workspaceId, type, ref_id: refId || null, is_read: false, created_at: new Date() });
   await publish(
     {
       type: 'notification.created',
@@ -27,31 +24,31 @@ export async function notifyUser(userId, workspaceId, type, refId) {
   return n;
 }
 
-// GET /notifications?limit= — mine, newest first.
 notificationsRouter.get('/notifications', requireAuth, async (req, res, next) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 30, 100);
-    const r = await query(
-      `SELECT n.*, w.name AS workspace_name FROM notifications n
-       JOIN workspaces w ON w.id = n.workspace_id
-       WHERE n.user_id = $1 ORDER BY n.created_at DESC LIMIT $2`,
-      [req.user.id, limit]
-    );
-    const unread = await query('SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = $1 AND is_read = false', [req.user.id]);
-    res.json({ notifications: r.rows, unreadCount: unread.rows[0].n });
+    const r = await aggregate('notifications', [
+      { $match: { user_id: req.user.id } },
+      { $lookup: { from: 'workspaces', localField: 'workspace_id', foreignField: '_id', as: 'workspace' } },
+      { $unwind: { path: '$workspace', preserveNullAndEmptyArrays: true } },
+      { $addFields: { workspace_name: '$workspace.name' } },
+      { $sort: { created_at: -1 } },
+      { $limit: limit }
+    ]);
+    const unread = await count('notifications', { user_id: req.user.id, is_read: false });
+    res.json({ notifications: r, unreadCount: unread });
   } catch (e) {
     next(e);
   }
 });
 
-// POST /notifications/read {ids?} — empty = mark all read.
 notificationsRouter.post('/notifications/read', requireAuth, async (req, res, next) => {
   try {
     const { ids } = req.body || {};
     if (ids && ids.length) {
-      await query('UPDATE notifications SET is_read = true WHERE user_id = $1 AND id = ANY($2)', [req.user.id, ids]);
+      await updateOne('notifications', { user_id: req.user.id }, { $set: { is_read: true } });
     } else {
-      await query('UPDATE notifications SET is_read = true WHERE user_id = $1', [req.user.id]);
+      await updateOne('notifications', { user_id: req.user.id }, { $set: { is_read: true } });
     }
     res.json({ ok: true });
   } catch (e) {

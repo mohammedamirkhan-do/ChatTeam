@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query, getOne } from '../../database/db.js';
+import { findOne, insertOne, updateOne, deleteOne, find } from '../../database/db.js';
 import { requireAuth } from '../../common/auth.js';
 import { requireWorkspace } from '../workspaces/permissions.js';
 import {
@@ -20,15 +20,15 @@ function publicCanvas(row) {
 
 async function requireCanvas(req, res, next) {
   try {
-    const cv = await getOne('SELECT * FROM canvas WHERE id = $1', [req.params.id]);
+    const cv = await findOne('canvas', { id: req.params.id });
     if (!cv) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Canvas not found' } });
-    const mem = await getOne('SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [cv.workspace_id, req.user.id]);
+    const mem = await findOne('workspace_members', { workspace_id: cv.workspace_id, user_id: req.user.id });
     if (!mem) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not a workspace member' } });
     // Channel-linked canvases inherit private-channel visibility (Slack parity).
     if (cv.channel_id) {
-      const ch = await getOne('SELECT is_private FROM channels WHERE id = $1', [cv.channel_id]);
+      const ch = await findOne('channels', { id: cv.channel_id });
       if (ch?.is_private) {
-        const cm = await getOne('SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2', [cv.channel_id, req.user.id]);
+        const cm = await findOne('channel_members', { channel_id: cv.channel_id, user_id: req.user.id });
         if (!cm) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Canvas not found' } });
       }
     }
@@ -40,10 +40,10 @@ async function requireCanvas(req, res, next) {
 }
 
 async function loadBlocks(canvasId) {
-  const r = await query('SELECT * FROM canvas_blocks WHERE canvas_id = $1 ORDER BY position, id', [canvasId]);
-  return r.rows.map((b) => ({
+  const rows = await find('canvas_blocks', { canvas_id: canvasId });
+  return rows.map((b) => ({
     id: b.id, kind: b.kind, content: b.content, data: b.data,
-    position: Number(b.position), version: b.version,
+    position: Number(b.position), version: b.version ?? 1,
     updatedBy: b.updated_by, updatedAt: b.updated_at,
   }));
 }
@@ -53,19 +53,13 @@ canvasRouter.post('/workspaces/:wid/canvas', requireAuth, requireWorkspace, asyn
   try {
     const { title, channelId } = validate(canvasCreateSchema, req.body);
     if (channelId) {
-      const ch = await getOne('SELECT id, workspace_id FROM channels WHERE id = $1', [channelId]);
+      const ch = await findOne('channels', { id: channelId });
       if (!ch || ch.workspace_id !== req.workspace.id) {
         return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Channel not found' } });
       }
     }
-    const cv = await getOne(
-      'INSERT INTO canvas(workspace_id, channel_id, title, created_by) VALUES ($1,$2,$3,$4) RETURNING *',
-      [req.workspace.id, channelId || null, title, req.user.id]
-    );
-    const first = await getOne(
-      `INSERT INTO canvas_blocks(canvas_id, kind, content, position, updated_by) VALUES ($1,'paragraph','',0,$2) RETURNING *`,
-      [cv.id, req.user.id]
-    );
+    const cv = await insertOne('canvas', { workspace_id: req.workspace.id, channel_id: channelId || null, title, created_by: req.user.id });
+    const first = await insertOne('canvas_blocks', { canvas_id: cv.id, kind: 'paragraph', content: '', position: 0, version: 1, updated_by: req.user.id });
     await publish({ type: 'canvas.created', payload: { canvas: publicCanvas(cv) } }, [`workspace:${req.workspace.id}`]);
     res.status(201).json({ canvas: publicCanvas(cv), blocks: await loadBlocks(cv.id), _seed: first.id });
   } catch (e) {
@@ -76,8 +70,8 @@ canvasRouter.post('/workspaces/:wid/canvas', requireAuth, requireWorkspace, asyn
 // GET /workspaces/:wid/canvas — workspace docs.
 canvasRouter.get('/workspaces/:wid/canvas', requireAuth, requireWorkspace, async (req, res, next) => {
   try {
-    const r = await query('SELECT * FROM canvas WHERE workspace_id = $1 ORDER BY updated_at DESC LIMIT 100', [req.workspace.id]);
-    res.json({ canvas: r.rows.map(publicCanvas) });
+    const rows = await find('canvas', { workspace_id: req.workspace.id });
+    res.json({ canvas: rows.map(publicCanvas) });
   } catch (e) {
     next(e);
   }
@@ -86,11 +80,12 @@ canvasRouter.get('/workspaces/:wid/canvas', requireAuth, requireWorkspace, async
 // GET /canvas/:id — doc + blocks + comments.
 canvasRouter.get('/canvas/:id', requireAuth, requireCanvas, async (req, res, next) => {
   try {
-    const comments = await query(
-      `SELECT cc.*, u.display_name AS author FROM canvas_comments cc JOIN users u ON u.id = cc.user_id
-       WHERE cc.canvas_id = $1 ORDER BY cc.created_at`, [req.canvas.id]
-    );
-    res.json({ canvas: publicCanvas(req.canvas), blocks: await loadBlocks(req.canvas.id), comments: comments.rows });
+    const comments = await find('canvas_comments', { canvas_id: req.canvas.id }, { sort: { created_at: 1 } });
+    const users = await find('users', { id: { $in: comments.map(c => c.user_id) } });
+    const userMap = {};
+    for (const u of users) userMap[u.id] = u;
+    const commentsWithUsers = comments.map(c => ({ ...c, author: userMap[c.user_id]?.display_name }));
+    res.json({ canvas: publicCanvas(req.canvas), blocks: await loadBlocks(req.canvas.id), comments: commentsWithUsers });
   } catch (e) {
     next(e);
   }
@@ -100,7 +95,8 @@ canvasRouter.get('/canvas/:id', requireAuth, requireCanvas, async (req, res, nex
 canvasRouter.patch('/canvas/:id', requireAuth, requireCanvas, async (req, res, next) => {
   try {
     const { title } = validate(canvasPatchSchema, req.body);
-    const updated = await getOne('UPDATE canvas SET title = $2, updated_at = now() WHERE id = $1 RETURNING *', [req.canvas.id, title]);
+    await updateOne('canvas', { id: req.canvas.id }, { $set: { title, updated_at: new Date() } });
+    const updated = await findOne('canvas', { id: req.canvas.id });
     const out = publicCanvas(updated);
     await publish({ type: 'canvas.updated', payload: { canvas: out } }, [`canvas:${req.canvas.id}`]);
     res.json({ canvas: out });
@@ -112,7 +108,7 @@ canvasRouter.patch('/canvas/:id', requireAuth, requireCanvas, async (req, res, n
 // DELETE /canvas/:id
 canvasRouter.delete('/canvas/:id', requireAuth, requireCanvas, async (req, res, next) => {
   try {
-    await query('DELETE FROM canvas WHERE id = $1', [req.canvas.id]);
+    await deleteOne('canvas', { id: req.canvas.id });
     await publish({ type: 'canvas.deleted', payload: { id: req.canvas.id } }, [`workspace:${req.canvas.workspace_id}`]);
     res.json({ ok: true });
   } catch (e) {
@@ -128,33 +124,25 @@ canvasRouter.put('/canvas/:id/blocks', requireAuth, requireCanvas, async (req, r
     const changed = [];
     for (const b of blocks) {
       if (b.delete && b.id) {
-        await query('DELETE FROM canvas_blocks WHERE id = $1 AND canvas_id = $2', [b.id, req.canvas.id]);
+        await deleteOne('canvas_blocks', { id: b.id, canvas_id: req.canvas.id });
         changed.push({ id: b.id, deleted: true });
         continue;
       }
       if (b.id) {
-        const cur = await getOne('SELECT * FROM canvas_blocks WHERE id = $1 AND canvas_id = $2', [b.id, req.canvas.id]);
+        const cur = await findOne('canvas_blocks', { id: b.id, canvas_id: req.canvas.id });
         if (!cur) continue;
-        const incoming = b.version || 1;
-        if (incoming < cur.version) continue; // loser of the race — stored wins
-        const row = await getOne(
-          `UPDATE canvas_blocks SET kind = COALESCE($3, kind), content = COALESCE($4, content),
-            data = COALESCE($5, data), position = COALESCE($6, position),
-            version = $7, updated_by = $8, updated_at = now()
-           WHERE id = $1 AND canvas_id = $2 RETURNING *`,
-          [b.id, req.canvas.id, b.kind, b.content, JSON.stringify(b.data ?? {}), b.position ?? cur.position, Math.max(incoming, cur.version + (incoming === cur.version ? 1 : 0)), req.user.id]
-        );
+        const incoming = b.version ?? 1;
+        const curVersion = cur.version ?? 1;
+        if (incoming < curVersion) continue; // loser of the race — stored wins
+        await updateOne('canvas_blocks', { id: b.id, canvas_id: req.canvas.id }, { $set: { kind: b.kind || cur.kind, content: b.content ?? cur.content, data: b.data ?? cur.data, position: b.position ?? cur.position, version: Math.max(incoming, curVersion + (incoming === curVersion ? 1 : 0)), updated_by: req.user.id, updated_at: new Date() } });
+        const row = await findOne('canvas_blocks', { id: b.id, canvas_id: req.canvas.id });
         changed.push({ id: row.id, version: row.version });
       } else {
-        const row = await getOne(
-          `INSERT INTO canvas_blocks(canvas_id, kind, content, data, position, updated_by)
-           VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-          [req.canvas.id, b.kind || 'paragraph', b.content || '', JSON.stringify(b.data ?? {}), b.position ?? Date.now(), req.user.id]
-        );
+        const row = await insertOne('canvas_blocks', { canvas_id: req.canvas.id, kind: b.kind || 'paragraph', content: b.content || '', data: JSON.stringify(b.data ?? {}), position: b.position ?? Date.now(), version: 1, updated_by: req.user.id });
         changed.push({ id: row.id, version: row.version });
       }
     }
-    await query('UPDATE canvas SET updated_at = now() WHERE id = $1', [req.canvas.id]);
+    await updateOne('canvas', { id: req.canvas.id }, { $set: { updated_at: new Date() } });
     const all = await loadBlocks(req.canvas.id);
     await publish({ type: 'canvas.blocks', payload: { canvasId: req.canvas.id, blocks: all, by: req.user.id } }, [`canvas:${req.canvas.id}`]);
     res.json({ blocks: all, changed });
@@ -168,13 +156,10 @@ canvasRouter.post('/canvas/:id/comments', requireAuth, requireCanvas, async (req
   try {
     const { content, blockId } = validate(canvasCommentSchema, req.body);
     if (blockId) {
-      const blk = await getOne('SELECT id FROM canvas_blocks WHERE id = $1 AND canvas_id = $2', [blockId, req.canvas.id]);
+      const blk = await findOne('canvas_blocks', { id: blockId, canvas_id: req.canvas.id });
       if (!blk) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Block not in this canvas' } });
     }
-    const c = await getOne(
-      'INSERT INTO canvas_comments(canvas_id, block_id, user_id, content) VALUES ($1,$2,$3,$4) RETURNING *',
-      [req.canvas.id, blockId || null, req.user.id, content]
-    );
+    const c = await insertOne('canvas_comments', { canvas_id: req.canvas.id, block_id: blockId || null, user_id: req.user.id, content });
     await publish({ type: 'canvas.comment', payload: { canvasId: req.canvas.id, comment: c } }, [`canvas:${req.canvas.id}`]);
     res.status(201).json({ comment: c });
   } catch (e) {

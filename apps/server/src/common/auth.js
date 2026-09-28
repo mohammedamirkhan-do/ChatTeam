@@ -1,5 +1,5 @@
 import { verifyAccessToken } from '../modules/auth/tokens.js';
-import { getOne } from '../database/db.js';
+import { findOne } from '../database/db.js';
 
 export function publicUser(u) {
   if (!u) return null;
@@ -29,9 +29,9 @@ export async function requireAuth(req, res, next) {
     } catch {
       return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
     }
-    const user = await getOne('SELECT * FROM users WHERE id = $1', [claims.sub]);
+    const user = await findOne('users', { id: claims.sub });
     if (!user) return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'User not found' } });
-    const session = await getOne('SELECT * FROM sessions WHERE id = $1', [claims.sid]);
+    const session = await findOne('sessions', { id: claims.sid });
     if (!session || session.revoked_at || new Date(session.expires_at) < new Date()) {
       return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Session revoked or expired' } });
     }

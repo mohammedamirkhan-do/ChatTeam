@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query, getOne } from '../../database/db.js';
+import { findOne, insertOne, updateOne, deleteOne, find, count } from '../../database/db.js';
 import { requireAuth } from '../../common/auth.js';
 import { requireWorkspace, requirePermission, hasPermission } from '../workspaces/permissions.js';
 import { createChannel, publicChannel, requireChannel } from './service.js';
@@ -25,7 +25,7 @@ function workspacesChannelRoutes() {
     try {
       // Slack parity: channel names are lowercase.
       const input = validate(channelCreateSchema, { ...req.body, name: String(req.body?.name || '').toLowerCase() });
-      const exists = await getOne('SELECT id FROM channels WHERE workspace_id = $1 AND name = $2', [req.workspace.id, input.name]);
+      const exists = await findOne('channels', { workspace_id: req.workspace.id, name: input.name });
       if (exists) return res.status(409).json({ error: { code: 'NAME_TAKEN', message: 'Channel name already in use' } });
       const ch = await createChannel(req.workspace.id, req.user.id, input);
       await publish({ type: 'channel.created', payload: { channel: publicChannel(ch, { memberCount: 1 }) } }, [`workspace:${req.workspace.id}`]);
@@ -38,18 +38,28 @@ function workspacesChannelRoutes() {
   // GET /workspaces/:wid/channels — public + private-where-member (Slack privacy).
   channelsRouter.get('/workspaces/:wid/channels', requireAuth, requireWorkspace, async (req, res, next) => {
     try {
-      const r = await query(
-        `SELECT c.*, (SELECT COUNT(*)::int FROM channel_members cm WHERE cm.channel_id = c.id) AS member_count,
-          (SELECT COUNT(*)::int FROM messages m
-            WHERE m.channel_id = c.id AND m.deleted_at IS NULL AND m.sender_id <> $2
-              AND m.created_at > COALESCE((SELECT last_read_at FROM channel_members cm2 WHERE cm2.channel_id = c.id AND cm2.user_id = $2), '-infinity')) AS unread_count
-         FROM channels c
-         WHERE c.workspace_id = $1
-           AND (c.is_private = false OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $2))
-         ORDER BY c.is_private, c.name`,
-        [req.workspace.id, req.user.id]
-      );
-      res.json({ channels: withCounts(r.rows) });
+      const allChannels = await find('channels', { workspace_id: req.workspace.id });
+      const rows = [];
+      for (const c of allChannels) {
+        if (c.is_private) {
+          const cm = await findOne('channel_members', { channel_id: c.id, user_id: req.user.id });
+          if (!cm) continue;
+        }
+        const memberCount = await count('channel_members', { channel_id: c.id });
+        const lastRead = await findOne('channel_members', { channel_id: c.id, user_id: req.user.id });
+        const unreadThreshold = lastRead?.last_read_at || null;
+        let unreadCount = 0;
+        if (unreadThreshold !== null) {
+          const msgs = await find('messages', { channel_id: c.id, deleted_at: null, sender_id: { $ne: req.user.id }, created_at: { $gt: unreadThreshold } });
+          unreadCount = msgs.length;
+        } else {
+          const msgs = await find('messages', { channel_id: c.id, deleted_at: null, sender_id: { $ne: req.user.id } });
+          unreadCount = msgs.length;
+        }
+        rows.push({ ...c, member_count: memberCount, unread_count: unreadCount });
+      }
+      rows.sort((a, b) => (a.is_private !== b.is_private ? (a.is_private ? 1 : -1) : a.name.localeCompare(b.name)));
+      res.json({ channels: withCounts(rows) });
     } catch (e) {
       next(e);
     }
@@ -59,8 +69,8 @@ function workspacesChannelRoutes() {
 // GET /channels/:id
 channelsRouter.get('/channels/:id', requireAuth, requireChannel, async (req, res, next) => {
   try {
-    const count = await getOne('SELECT COUNT(*)::int AS n FROM channel_members WHERE channel_id = $1', [req.channel.id]);
-    res.json({ channel: publicChannel(req.channel, { memberCount: count.n, myRole: req.channelRole }) });
+    const memberCount = await count('channel_members', { channel_id: req.channel.id });
+    res.json({ channel: publicChannel(req.channel, { memberCount, myRole: req.channelRole }) });
   } catch (e) {
     next(e);
   }
@@ -76,25 +86,22 @@ channelsRouter.patch('/channels/:id', requireAuth, requireChannel, async (req, r
       ...req.body,
       ...(req.body?.name !== undefined ? { name: String(req.body.name).toLowerCase() } : {}),
     });
-    const sets = [];
-    const params = [];
+    const sets = {};
     if (patch.name !== undefined) {
-      const clash = await getOne('SELECT id FROM channels WHERE workspace_id = $1 AND name = $2 AND id <> $3', [req.channel.workspace_id, patch.name, req.channel.id]);
+      const clash = await findOne('channels', { workspace_id: req.channel.workspace_id, name: patch.name, id: { $ne: req.channel.id } });
       if (clash) return res.status(409).json({ error: { code: 'NAME_TAKEN', message: 'Channel name already in use' } });
-      params.push(patch.name, patch.name.toLowerCase());
-      sets.push(`name = $${params.length - 1}`, `slug = $${params.length}`);
+      sets.name = patch.name;
+      sets.slug = patch.name.toLowerCase();
     }
     if (patch.description !== undefined) {
-      params.push(patch.description);
-      sets.push(`description = $${params.length}`);
+      sets.description = patch.description;
     }
     if (patch.topic !== undefined) {
-      params.push(patch.topic);
-      sets.push(`topic = $${params.length}`);
+      sets.topic = patch.topic;
     }
-    if (!sets.length) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Nothing to update' } });
-    params.push(req.channel.id);
-    const ch = await getOne(`UPDATE channels SET ${sets.join(', ')}, updated_at = now() WHERE id = $${params.length} RETURNING *`, params);
+    if (!Object.keys(sets).length) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Nothing to update' } });
+    await updateOne('channels', { id: req.channel.id }, { $set: { ...sets, updated_at: new Date() } });
+    const ch = await findOne('channels', { id: req.channel.id });
     await publish({ type: 'channel.updated', payload: { channel: publicChannel(ch) } }, [`workspace:${ch.workspace_id}`]);
     res.json({ channel: publicChannel(ch) });
   } catch (e) {
@@ -109,7 +116,7 @@ channelsRouter.post('/channels/:id/join', requireAuth, requireChannel, async (re
     if (req.channelRole) return res.json({ ok: true, already: true });
     if (req.channel.is_private) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Private channel — ask a member to add you' } });
     if (req.workspaceRole === 'guest') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Guests join by invitation only' } });
-    await query('INSERT INTO channel_members(channel_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.channel.id, req.user.id]);
+    await insertOne('channel_members', { channel_id: req.channel.id, user_id: req.user.id, role: 'member' });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -121,7 +128,7 @@ channelsRouter.post('/channels/:id/leave', requireAuth, requireChannel, async (r
   try {
     if (!req.channelRole) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Not a member' } });
     if (req.channel.slug === 'general') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'You cannot leave #general' } });
-    await query('DELETE FROM channel_members WHERE channel_id = $1 AND user_id = $2', [req.channel.id, req.user.id]);
+    await deleteOne('channel_members', { channel_id: req.channel.id, user_id: req.user.id });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -134,7 +141,7 @@ channelsRouter.post('/channels/:id/archive', requireAuth, requireChannel, async 
     const ok = await hasPermission(req.channel.workspace_id, req.user.id, 'MANAGE_WORKSPACE');
     if (!ok) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Requires MANAGE_WORKSPACE' } });
     if (req.channel.slug === 'general') return res.status(403).json({ error: { code: 'FORBIDDEN', message: '#general cannot be archived' } });
-    await query('UPDATE channels SET is_archived = true WHERE id = $1', [req.channel.id]);
+    await updateOne('channels', { id: req.channel.id }, { $set: { is_archived: true } });
     await publish({ type: 'channel.archived', payload: { id: req.channel.id, workspaceId: req.channel.workspace_id } }, [`workspace:${req.channel.workspace_id}`]);
     res.json({ ok: true });
   } catch (e) {
@@ -146,7 +153,7 @@ channelsRouter.post('/channels/:id/unarchive', requireAuth, requireChannel, asyn
   try {
     const ok = await hasPermission(req.channel.workspace_id, req.user.id, 'MANAGE_WORKSPACE');
     if (!ok) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Requires MANAGE_WORKSPACE' } });
-    await query('UPDATE channels SET is_archived = false WHERE id = $1', [req.channel.id]);
+    await updateOne('channels', { id: req.channel.id }, { $set: { is_archived: false } });
     await publish({ type: 'channel.updated', payload: { channel: publicChannel({ ...req.channel, is_archived: false }) } }, [`workspace:${req.channel.workspace_id}`]);
     res.json({ ok: true });
   } catch (e) {
@@ -157,13 +164,18 @@ channelsRouter.post('/channels/:id/unarchive', requireAuth, requireChannel, asyn
 // GET /channels/:id/members
 channelsRouter.get('/channels/:id/members', requireAuth, requireChannel, async (req, res, next) => {
   try {
-    const r = await query(
-      `SELECT u.id, u.display_name, u.email, u.avatar_url, u.status, cm.role, cm.joined_at
-       FROM channel_members cm JOIN users u ON u.id = cm.user_id
-       WHERE cm.channel_id = $1 ORDER BY cm.joined_at`,
-      [req.channel.id]
-    );
-    res.json({ members: r.rows });
+    const members = await find('channel_members', { channel_id: req.channel.id });
+    const userIds = members.map(m => m.user_id);
+    const users = await find('users', { id: { $in: userIds } });
+    const userMap = {};
+    for (const u of users) userMap[u.id] = u;
+    const membersWithUsers = members.map(m => ({
+      ...userMap[m.user_id],
+      role: m.role,
+      joined_at: m.joined_at,
+    }));
+    membersWithUsers.sort((a, b) => new Date(a.joined_at) - new Date(b.joined_at));
+    res.json({ members: membersWithUsers });
   } catch (e) {
     next(e);
   }
@@ -176,9 +188,9 @@ channelsRouter.post('/channels/:id/members', requireAuth, requireChannel, async 
     if (!ok) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Requires INVITE_MEMBER' } });
     if (req.channel.is_archived) return res.status(403).json({ error: { code: 'ARCHIVED', message: 'Channel is archived' } });
     const { userId } = validate(channelMemberAddSchema, req.body);
-    const wsMember = await getOne('SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [req.channel.workspace_id, userId]);
+    const wsMember = await findOne('workspace_members', { workspace_id: req.channel.workspace_id, user_id: userId });
     if (!wsMember) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'User is not in this workspace' } });
-    await query('INSERT INTO channel_members(channel_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.channel.id, userId]);
+    await insertOne('channel_members', { channel_id: req.channel.id, user_id: userId, role: 'member' });
     res.status(201).json({ ok: true });
   } catch (e) {
     next(e);
@@ -193,7 +205,7 @@ channelsRouter.delete('/channels/:id/members/:userId', requireAuth, requireChann
       const ok = await hasPermission(req.channel.workspace_id, req.user.id, 'REMOVE_MEMBER');
       if (!ok) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Requires REMOVE_MEMBER' } });
     }
-    await query('DELETE FROM channel_members WHERE channel_id = $1 AND user_id = $2', [req.channel.id, req.params.userId]);
+    await deleteOne('channel_members', { channel_id: req.channel.id, user_id: req.params.userId });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -206,7 +218,7 @@ channelsRouter.delete('/channels/:id', requireAuth, requireChannel, async (req, 
     const ok = await hasPermission(req.channel.workspace_id, req.user.id, 'DELETE_CHANNEL');
     if (!ok) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Requires DELETE_CHANNEL' } });
     if (req.channel.slug === 'general') return res.status(403).json({ error: { code: 'FORBIDDEN', message: '#general cannot be deleted' } });
-    await query('DELETE FROM channels WHERE id = $1', [req.channel.id]);
+    await deleteOne('channels', { id: req.channel.id });
     await auditLog(req.channel.workspace_id, req.user.id, 'channel.deleted', 'channel', req.channel.id, { name: req.channel.name });
     await publish({ type: 'channel.deleted', payload: { id: req.channel.id, workspaceId: req.channel.workspace_id } }, [`workspace:${req.channel.workspace_id}`]);
     res.json({ ok: true });

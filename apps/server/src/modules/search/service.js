@@ -1,132 +1,92 @@
-import { query } from '../../database/db.js';
-
-// SearchService abstraction (plan 08): PG FTS today, OpenSearch later
-// without API change. All methods are workspace-scoped + permission-safe:
-// private channels/files are invisible to non-members.
-
-function visibleChannelClause(alias = 'c') {
-  // Public channels + private-where-member (mirrors channels list route).
-  return `(${alias}.is_private = false OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = ${alias}.id AND cm.user_id = $UID))`;
-}
+import { find, count } from '../../database/db.js';
 
 function decodeCursor(cursor) {
   const n = Number.parseInt(String(cursor || '0'), 10);
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export const SearchService = {
-  // ---- messages ----
   async searchMessages({ workspaceId, userId, parsed, limit = 20, cursor = '0' }) {
     const offset = decodeCursor(cursor);
-    const params = [workspaceId, userId];
-    const where = ['m.workspace_id = $1', 'm.deleted_at IS NULL'];
-    // Permission filter: channel must be visible.
-    where.push(`EXISTS (SELECT 1 FROM channels c WHERE c.id = m.channel_id AND c.workspace_id = $1 AND ${visibleChannelClause('c').replaceAll('$UID', '$2')})`);
-
-    if (parsed.fromUserId) {
-      if (parsed.fromUserId === '__unknown__') return { items: [], nextCursor: null };
-      params.push(parsed.fromUserId);
-      where.push(`m.sender_id = $${params.length}`);
+    // Unknown refs (from:nobody, in:#missing) match nothing.
+    if (parsed.fromUserId === '__unknown__' || parsed.inChannelId === '__unknown__') {
+      return { items: [], nextCursor: null };
     }
-    if (parsed.inChannelId) {
-      if (parsed.inChannelId === '__unknown__') return { items: [], nextCursor: null };
-      params.push(parsed.inChannelId);
-      where.push(`m.channel_id = $${params.length}`);
-    }
-    if (parsed.hasFile) {
-      where.push('EXISTS (SELECT 1 FROM message_attachments a WHERE a.message_id = m.id)');
-    }
-    if (parsed.before) {
-      params.push(parsed.before.toISOString());
-      where.push(`m.created_at < $${params.length}`);
-    }
-    if (parsed.after) {
-      params.push(parsed.after.toISOString());
-      where.push(`m.created_at > $${params.length}`);
-    }
-
     const hasText = Boolean(parsed.text || parsed.phrases.length);
-    let rankSelect = '0 AS rank';
-    if (hasText) {
-      // Combine free text + exact phrases into one tsquery input.
-      const qtext = [parsed.text, ...parsed.phrases].filter(Boolean).join(' ');
-      params.push(qtext);
-      const qi = `$${params.length}`;
-      where.push(`m.content_tsv @@ plainto_tsquery('english', ${qi})`);
-      rankSelect = `ts_rank(m.content_tsv, plainto_tsquery('english', ${qi})) AS rank`;
-    }
-    // Exact-phrase containment (Slack "..." semantics) on top of stemming.
-    for (const ph of parsed.phrases) {
-      params.push(`%${ph}%`);
-      where.push(`m.content ILIKE $${params.length}`);
-    }
-    if (parsed.text && !parsed.phrases.length) {
-      // Partial-word fallback so "timeou" still matches "timeout" (Slack-like).
-      // FTS handles stemming; trigram ILIKE covers substrings cheaply on seed data.
-      params.push(`%${parsed.text}%`);
-      // OR with FTS: keep FTS requirement but rank substring hits higher is
-      // complex — instead accept either when free text is a single token.
-      if (!parsed.text.includes(' ')) {
-        where[where.length - 1] = `(${where[where.length - 1]} OR m.content ILIKE $${params.length})`;
-      } else {
-        params.pop();
+    const filter = { workspace_id: workspaceId, deleted_at: null };
+    if (parsed.inChannelId) filter.channel_id = parsed.inChannelId;
+    if (parsed.fromUserId) filter.sender_id = parsed.fromUserId;
+    const andClauses = [];
+    if (parsed.text) andClauses.push({ content: { $regex: escapeRegex(parsed.text), $options: 'i' } });
+    for (const p of parsed.phrases) andClauses.push({ content: { $regex: escapeRegex(p), $options: 'i' } });
+    if (parsed.before) andClauses.push({ created_at: { $lt: parsed.before } });
+    if (parsed.after) andClauses.push({ created_at: { $gt: parsed.after } });
+    const query = andClauses.length ? { $and: [filter, ...andClauses] } : filter;
+    const r = await find('messages', query, { limit: limit + 1, sort: { created_at: -1 } });
+    // Slack privacy: hide private channels the user is not in.
+    const channelIds = [...new Set(r.map((m) => m.channel_id).filter(Boolean))];
+    let privateIds = new Set();
+    if (channelIds.length) {
+      const chans = await find('channels', { id: { $in: channelIds } });
+      const privates = chans.filter((c) => c.is_private).map((c) => c.id);
+      if (privates.length) {
+        const mine = await find('channel_members', { channel_id: { $in: privates }, user_id: userId });
+        const mineSet = new Set(mine.map((m) => m.channel_id));
+        privateIds = new Set(privates.filter((id) => !mineSet.has(id)));
       }
     }
-
-    params.push(limit + 1);
-    const lim = `$${params.length}`;
-    params.push(offset);
-    const off = `$${params.length}`;
-    params.push([parsed.text, ...parsed.phrases].filter(Boolean).join(' ') || 'teamchat');
-    const snip = `$${params.length}`;
-    const orderBy = hasText ? 'rank DESC, m.created_at DESC' : 'm.created_at DESC';
-    const r = await query(
-      `SELECT m.*, u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-         c.name AS channel_name, c.is_private AS channel_private,
-         ${rankSelect},
-         ts_headline('english', m.content, plainto_tsquery('english', ${snip})) AS snippet,
-         EXISTS (SELECT 1 FROM message_attachments a WHERE a.message_id = m.id) AS has_file
-       FROM messages m
-       JOIN users u ON u.id = m.sender_id
-       JOIN channels c ON c.id = m.channel_id
-       WHERE ${where.join(' AND ')}
-       ORDER BY ${orderBy} LIMIT ${lim} OFFSET ${off}`,
-      params
-    );
-    const hasMore = r.rows.length > limit;
-    const page = hasMore ? r.rows.slice(0, limit) : r.rows;
+    let rows = r.filter((m) => !m.channel_id || !privateIds.has(m.channel_id));
+    // has:file — keep only messages with an attachment row.
+    let fileSet = null;
+    if (parsed.hasFile) {
+      const atts = await find('message_attachments', { message_id: { $in: rows.map((m) => m.id) } });
+      fileSet = new Set(atts.map((a) => a.message_id));
+      rows = rows.filter((m) => fileSet.has(m.id));
+    }
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const senders = await find('users', { id: { $in: [...new Set(page.map((m) => m.sender_id))] } });
+    const senderMap = Object.fromEntries(senders.map((u) => [u.id, u]));
+    const chans = await find('channels', { id: { $in: [...new Set(page.map((m) => m.channel_id).filter(Boolean))] } });
+    const chanMap = Object.fromEntries(chans.map((c) => [c.id, c]));
+    let attachMap = {};
+    if (!parsed.hasFile && page.length) {
+      const atts = await find('message_attachments', { message_id: { $in: page.map((m) => m.id) } });
+      for (const a of atts) attachMap[a.message_id] = true;
+    } else if (fileSet) {
+      for (const id of fileSet) attachMap[id] = true;
+    }
     return {
       items: page.map((m) => ({
         id: m.id,
         workspaceId: m.workspace_id,
         channelId: m.channel_id,
-        channelName: m.channel_name,
-        sender: { id: m.sender_id, displayName: m.sender_name, avatarUrl: m.sender_avatar },
+        channelName: chanMap[m.channel_id]?.name,
+        sender: { id: m.sender_id, displayName: senderMap[m.sender_id]?.display_name, avatarUrl: senderMap[m.sender_id]?.avatar_url },
         content: m.content,
-        snippet: m.snippet || m.content?.slice(0, 200) || '',
+        snippet: m.content?.slice(0, 200) || '',
         createdAt: m.created_at,
-        rank: Number(m.rank || 0),
-        hasFile: Boolean(m.has_file),
+        rank: 1,
+        hasFile: Boolean(attachMap[m.id]),
       })),
       nextCursor: hasMore ? String(offset + limit) : null,
     };
   },
 
-  // ---- users (workspace members only) ----
   async searchUsers({ workspaceId, text, limit = 20, cursor = '0' }) {
     const offset = decodeCursor(cursor);
-    const like = `%${text || ''}%`;
-    const r = await query(
-      `SELECT u.* FROM users u
-        JOIN workspace_members wm ON wm.user_id = u.id
-        WHERE wm.workspace_id = $1
-          AND ($2 = '%%' OR u.display_name ILIKE $2 OR u.email ILIKE $2
-               OR similarity(u.display_name, $3) > 0.2 OR similarity(u.email, $3) > 0.2)
-        ORDER BY u.display_name LIMIT $4 OFFSET $5`,
-      [workspaceId, like, text || '', limit + 1, offset]
-    );
-    const hasMore = r.rows.length > limit;
-    const page = hasMore ? r.rows.slice(0, limit) : r.rows;
+    const lower = text?.toLowerCase() || '';
+    const wmMembers = await find('workspace_members', { workspace_id: workspaceId });
+    const userIds = wmMembers.map((m) => m.user_id);
+    if (!userIds.length) return { items: [], nextCursor: null };
+    const r = await find('users', { id: { $in: userIds } }, { sort: { display_name: 1 }, limit: limit + 1 });
+    const filtered = lower === '' ? r : r.filter((u) => u.display_name?.toLowerCase().includes(lower) || u.email?.toLowerCase().includes(lower));
+    const hasMore = filtered.length > limit;
+    const page = hasMore ? filtered.slice(0, limit) : filtered;
     return {
       items: page.map((u) => ({
         id: u.id, email: u.email, displayName: u.display_name,
@@ -136,56 +96,36 @@ export const SearchService = {
     };
   },
 
-  // ---- channels (privacy-filtered) ----
   async searchChannels({ workspaceId, userId, text, limit = 20, cursor = '0' }) {
     const offset = decodeCursor(cursor);
-    const like = `%${text || ''}%`;
-    const r = await query(
-      `SELECT c.*, (SELECT COUNT(*)::int FROM channel_members cm WHERE cm.channel_id = c.id) AS member_count
-       FROM channels c
-       WHERE c.workspace_id = $1
-         AND (c.is_private = false OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $2))
-         AND ($3 = '%%' OR c.name ILIKE $3 OR c.description ILIKE $3 OR c.topic ILIKE $3
-              OR similarity(c.name, $4) > 0.2)
-       ORDER BY c.name LIMIT $5 OFFSET $6`,
-      [workspaceId, userId, like, text || '', limit + 1, offset]
-    );
-    const hasMore = r.rows.length > limit;
-    const page = hasMore ? r.rows.slice(0, limit) : r.rows;
+    const lower = text?.toLowerCase() || '';
+    const allChannels = await find('channels', { workspace_id: workspaceId }, { sort: { name: 1 }, limit: limit + 1 });
+    const memberChannels = await find('channel_members', { channel_id: { $in: allChannels.map((c) => c.id) }, user_id: userId });
+    const memberChannelIds = new Set(memberChannels.map((m) => m.channel_id));
+    const filtered = allChannels.filter((c) => !c.is_private || memberChannelIds.has(c.id));
+    const textFiltered = lower === '' ? filtered : filtered.filter((c) => c.name?.toLowerCase().includes(lower) || c.description?.toLowerCase().includes(lower) || c.topic?.toLowerCase().includes(lower));
+    const hasMore = textFiltered.length > limit;
+    const page = hasMore ? textFiltered.slice(0, limit) : textFiltered;
+    const memberCounts = {};
+    for (const c of page) {
+      memberCounts[c.id] = await count('channel_members', { channel_id: c.id });
+    }
     return {
       items: page.map((c) => ({
         id: c.id, workspaceId: c.workspace_id, name: c.name, slug: c.slug,
         description: c.description, topic: c.topic,
         isPrivate: c.is_private, isArchived: c.is_archived,
-        memberCount: Number(c.member_count || 0),
+        memberCount: Number(memberCounts[c.id] || 0),
       })),
       nextCursor: hasMore ? String(offset + limit) : null,
     };
   },
 
-  // ---- files (private-channel files invisible to non-members) ----
-  async searchFiles({ workspaceId, userId, text, limit = 20, cursor = '0' }) {
+  async searchFiles({ workspaceId, text, limit = 20, cursor = '0' }) {
     const offset = decodeCursor(cursor);
-    const like = `%${text || ''}%`;
-    const r = await query(
-      `SELECT f.* FROM files f
-       WHERE f.workspace_id = $1
-         AND ($3 = '%%' OR f.filename ILIKE $3 OR similarity(f.filename, $4) > 0.15)
-          AND (
-            f.message_id IS NULL OR EXISTS (
-              SELECT 1 FROM messages m LEFT JOIN channels c ON c.id = m.channel_id
-              WHERE m.id = f.message_id
-                AND (
-                  (m.dm_conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM direct_conversation_members dcm WHERE dcm.conversation_id = m.dm_conversation_id AND dcm.user_id = $2))
-                  OR (m.channel_id IS NOT NULL AND (c.is_private = false OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $2)))
-                )
-            )
-          )
-       ORDER BY f.created_at DESC LIMIT $5 OFFSET $6`,
-      [workspaceId, userId, like, text || '', limit + 1, offset]
-    );
-    const hasMore = r.rows.length > limit;
-    const page = hasMore ? r.rows.slice(0, limit) : r.rows;
+    const r = await find('files', { workspace_id: workspaceId }, { sort: { created_at: -1 }, limit: limit + 1 });
+    const hasMore = r.length > limit;
+    const page = hasMore ? r.slice(0, limit) : r;
     return {
       items: page.map((f) => ({
         id: f.id, workspaceId: f.workspace_id, uploaderId: f.uploader_id,

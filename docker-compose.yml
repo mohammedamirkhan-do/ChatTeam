@@ -1,19 +1,16 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: teamchat-postgres
+  mongo:
+    image: mongo:7
+    container_name: teamchat-mongo
     restart: unless-stopped
     environment:
-      POSTGRES_USER: teamchat
-      POSTGRES_PASSWORD: teamchat
-      POSTGRES_DB: teamchat
+      MONGO_INITDB_DATABASE: teamchat
     ports:
-      - "5432:5432"
+      - "27017:27017"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mongodata:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U teamchat"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -40,7 +37,7 @@ services:
     container_name: teamchat-server
     restart: unless-stopped
     depends_on:
-      postgres:
+      mongo:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -48,7 +45,7 @@ services:
         condition: service_started
     environment:
       PORT: 3000
-      DATABASE_URL: postgres://teamchat:teamchat@postgres:5432/teamchat
+      DATABASE_URL: mongodb://mongo:27017/teamchat
       REDIS_URL: redis://redis:6379
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
@@ -64,8 +61,6 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      # Live-mount server source only. No node_modules volume: the image's
-      # /app/node_modules is complete, and we never mount host modules in.
       - ./apps/server/src:/app/apps/server/src
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/version').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
@@ -87,15 +82,10 @@ services:
     ports:
       - "5173:5173"
     volumes:
-      # Live-mount source dirs only — never the package root itself, or the
-      # image's pnpm node_modules links get shadowed (MODULE_NOT_FOUND).
       - ./apps/desktop/renderer:/app/apps/desktop/renderer
       - ./apps/desktop/electron:/app/apps/desktop/electron
       - ./apps/desktop/index.html:/app/apps/desktop/index.html
 
-  # Object storage (S3-compatible). MinIO removed its free Docker Hub images,
-  # so we use SeaweedFS. Any S3 target works — swapping is config-only
-  # (S3_* env). Nothing before Phase 7 needs object storage.
   seaweed:
     image: chrislusf/seaweedfs:latest
     container_name: teamchat-seaweed
@@ -108,5 +98,5 @@ services:
       - seaweeddata:/data
 
 volumes:
-  pgdata:
+  mongodata:
   seaweeddata:

@@ -1,6 +1,5 @@
-import { getOne, query } from '../../database/db.js';
+import { findOne, find, count, aggregate } from '../../database/db.js';
 
-// Serialize a message row (+ sender join) into the API shape.
 export function serializeMessage(row, { reactions = [], mentionIds = [], attachments = [], buttonsMap = {} } = {}) {
   const deleted = Boolean(row.deleted_at);
   const counts = {};
@@ -45,95 +44,95 @@ export function serializeMessage(row, { reactions = [], mentionIds = [], attachm
 
 export async function loadReactions(messageIds, meId) {
   if (!messageIds.length) return [];
-  const r = await query(
-    `SELECT message_id, emoji, COUNT(*)::int AS n, bool_or(user_id = $2) AS mine
-     FROM message_reactions WHERE message_id = ANY($1) GROUP BY message_id, emoji`,
-    [messageIds, meId]
-  );
-  return r.rows;
+  const r = await aggregate('message_reactions', [
+    { $match: { message_id: { $in: messageIds } } },
+    { $group: { _id: { message_id: '$message_id', emoji: '$emoji' }, n: { $sum: 1 }, mine: { $max: { $eq: ['$user_id', meId] } } } },
+    { $project: { _id: 0, message_id: '$_id.message_id', emoji: '$_id.emoji', n: 1, mine: 1 } }
+  ]);
+  return r;
 }
 
 export async function loadAttachments(messageIds) {
   if (!messageIds.length) return [];
-  const r = await query('SELECT message_id, file_id, filename, mime_type, size, url, thumb_url, width, height FROM message_attachments WHERE message_id = ANY($1)', [messageIds]);
-  return r.rows;
+  const r = await find('message_attachments', { message_id: { $in: messageIds } });
+  return r;
 }
 
 export async function loadButtons(messageIds) {
   if (!messageIds.length) return {};
-  const r = await query('SELECT message_id, action_id, label FROM message_buttons WHERE message_id = ANY($1)', [messageIds]);
+  const r = await find('message_buttons', { message_id: { $in: messageIds } });
   const map = {};
-  for (const row of r.rows) {
+  for (const row of r) {
     (map[row.message_id] = map[row.message_id] || []).push({ id: row.action_id, label: row.label });
   }
   return map;
 }
 
-// Batch-attach interactive buttons to already-serialized messages.
 export async function withButtons(serialized) {
   const map = await loadButtons(serialized.map((m) => m.id));
   return serialized.map((m) => ({ ...m, buttons: map[m.id] || m.buttons || [] }));
 }
+
 export async function loadMentions(messageIds) {
   if (!messageIds.length) return {};
-  const r = await query('SELECT message_id, mentioned_user_id FROM message_mentions WHERE message_id = ANY($1)', [messageIds]);
+  const r = await find('message_mentions', { message_id: { $in: messageIds } });
   const map = {};
-  for (const row of r.rows) {
+  for (const row of r) {
     (map[row.message_id] = map[row.message_id] || []).push(row.mentioned_user_id);
   }
   return map;
 }
 
-const MESSAGE_SELECT = `
-  SELECT m.*, u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-    (SELECT COUNT(*) FROM messages r WHERE r.parent_message_id = m.id AND r.deleted_at IS NULL) AS reply_count,
-    (SELECT COUNT(*) FROM message_edits e WHERE e.message_id = m.id) AS edit_count
-  FROM messages m JOIN users u ON u.id = m.sender_id`;
-
 export async function getMessage(id) {
-  return getOne(`${MESSAGE_SELECT} WHERE m.id = $1`, [id]);
+  const results = await aggregate('messages', [
+    { $match: { _id: id } },
+    { $lookup: { from: 'users', localField: 'sender_id', foreignField: '_id', as: 'sender_doc' } },
+    { $unwind: { path: '$sender_doc', preserveNullAndEmptyArrays: true } },
+    { $addFields: { sender_name: '$sender_doc.display_name', sender_avatar: '$sender_doc.avatar_url' } },
+    { $lookup: { from: 'messages', let: { parentId: '$_id' }, pipeline: [{ $match: { $expr: { $and: [{ $eq: ['$parent_message_id', '$$parentId'] }, { $eq: ['$deleted_at', null] }] } } }, { $count: 'reply_count' }], as: 'reply_count_doc' } },
+    { $addFields: { reply_count: { $ifNull: ['$reply_count_doc.0', 0] } } },
+    { $lookup: { from: 'message_edits', localField: '_id', foreignField: 'message_id', as: 'edits_doc' } },
+    { $addFields: { edit_count: { $size: '$edits_doc' } } },
+    { $project: { sender_doc: 0, reply_count_doc: 0, edits_doc: 0 } }
+  ]);
+  return results[0] || null;
 }
 
-// Loads a message + enforces channel OR DM access for a user.
-// Returns { message, channel?, dm?, wsRole?, chRole? } or throws { status }.
 export async function accessMessage(messageId, userId) {
   const message = await getMessage(messageId);
   if (!message) throw Object.assign(new Error('Message not found'), { status: 404, code: 'NOT_FOUND' });
   if (message.dm_conversation_id) {
-    const dm = await getOne('SELECT * FROM direct_conversations WHERE id = $1', [message.dm_conversation_id]);
-    const wsMember = await getOne('SELECT * FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [dm.workspace_id, userId]);
+    const dm = await findOne('direct_conversations', { id: message.dm_conversation_id });
+    const wsMember = await findOne('workspace_members', { workspace_id: dm.workspace_id, user_id: userId });
     if (!wsMember) throw Object.assign(new Error('Not a workspace member'), { status: 403, code: 'FORBIDDEN' });
-    const dmMember = await getOne('SELECT * FROM direct_conversation_members WHERE conversation_id = $1 AND user_id = $2', [dm.id, userId]);
+    const dmMember = await findOne('direct_conversation_members', { conversation_id: dm.id, user_id: userId });
     if (!dmMember) throw Object.assign(new Error('Conversation not found'), { status: 404, code: 'NOT_FOUND' });
     return { message, dm, wsRole: wsMember.role, chRole: null };
   }
-  const channel = await getOne('SELECT * FROM channels WHERE id = $1', [message.channel_id]);
-  const wsMember = await getOne('SELECT * FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [channel.workspace_id, userId]);
+  const channel = await findOne('channels', { id: message.channel_id });
+  const wsMember = await findOne('workspace_members', { workspace_id: channel.workspace_id, user_id: userId });
   if (!wsMember) throw Object.assign(new Error('Not a workspace member'), { status: 403, code: 'FORBIDDEN' });
-  const chMember = await getOne('SELECT * FROM channel_members WHERE channel_id = $1 AND user_id = $2', [channel.id, userId]);
+  const chMember = await findOne('channel_members', { channel_id: channel.id, user_id: userId });
   if (channel.is_private && !chMember) throw Object.assign(new Error('Private channel'), { status: 403, code: 'FORBIDDEN' });
   return { message, channel, wsRole: wsMember.role, chRole: chMember ? chMember.role : null };
 }
 
-// @email mentions in content -> workspace member ids.
 export async function resolveMentionEmails(workspaceId, content) {
-  // Note: Array.from (not iterator.map) — Iterator Helpers don't exist on Node 20.
   const emails = [...new Set(Array.from(content.matchAll(/@([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g), (m) => m[1].toLowerCase()))];
   if (!emails.length) return [];
-  const r = await query(
-    `SELECT u.id FROM users u JOIN workspace_members wm ON wm.user_id = u.id
-     WHERE wm.workspace_id = $1 AND lower(u.email) = ANY($2)`,
-    [workspaceId, emails]
-  );
-  return r.rows.map((x) => x.id);
+  const r = await aggregate('workspace_members', [
+    { $match: { workspace_id: workspaceId } },
+    { $lookup: { from: 'users', localField: 'user_id', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $match: { 'user.email': { $in: emails } } },
+    { $project: { _id: 0, id: '$user._id' } }
+  ]);
+  return r.map((x) => x.id);
 }
 
 export async function filterWorkspaceMembers(workspaceId, userIds) {
   const ids = [...new Set(userIds)];
   if (!ids.length) return [];
-  const r = await query(
-    'SELECT user_id FROM workspace_members WHERE workspace_id = $1 AND user_id = ANY($2)',
-    [workspaceId, ids]
-  );
-  return r.rows.map((x) => x.user_id);
+  const r = await find('workspace_members', { workspace_id: workspaceId, user_id: { $in: ids } });
+  return r.map((x) => x.user_id);
 }

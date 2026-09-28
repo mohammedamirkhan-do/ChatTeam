@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query } from '../../database/db.js';
+import { insertOne } from '../../database/db.js';
 import { validate } from '@teamchat/validation';
 import { logger } from '../../common/logger.js';
 
@@ -14,18 +14,12 @@ const crashSchema = z.object({
   context: z.record(z.unknown()).optional().default({}),
 });
 
-// POST /crashes — unauthenticated by design (the reporter may be unable to
-// auth). Payload-capped, no PII beyond what the client sends.
 crashesRouter.post('/crashes', async (req, res, next) => {
   try {
     const body = validate(crashSchema, req.body);
-    const row = await query(
-      `INSERT INTO crash_reports(app_version, platform, error, stack, context)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id, created_at`,
-      [body.appVersion, body.platform, body.error, body.stack || null, body.context]
-    );
-    logger.warn({ crashId: row.rows[0].id, appVersion: body.appVersion, platform: body.platform }, 'desktop crash report');
-    res.status(201).json({ id: row.rows[0].id, receivedAt: row.rows[0].created_at });
+    const row = await insertOne('crash_reports', { app_version: body.appVersion, platform: body.platform, error: body.error, stack: body.stack || null, context: body.context, created_at: new Date() });
+    logger.warn({ crashId: row.id, appVersion: body.appVersion, platform: body.platform }, 'desktop crash report');
+    res.status(201).json({ id: row.id, receivedAt: row.created_at });
   } catch (e) {
     next(e);
   }

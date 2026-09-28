@@ -1,25 +1,30 @@
-import pg from 'pg';
+import { MongoClient } from 'mongodb';
 import { config } from '../config/index.js';
 
-const { Pool } = pg;
-export const pool = new Pool({
-  connectionString: config.databaseUrl,
-  connectionTimeoutMillis: 3000,
+const client = new MongoClient(config.databaseUrl, {
+  maxPoolSize: 10,
+  connectTimeoutMS: 5000,
 });
-// Prevent crash on background pool errors (e.g. PG down): /health must degrade, not die.
-pool.on('error', () => {});
+let connected = false;
 
-export async function checkPostgres() {
-  let client;
+export async function getDb() {
+  if (!connected) {
+    await client.connect();
+    connected = true;
+  }
+  return client.db('teamchat');
+}
+
+export async function checkMongoDB() {
   try {
-    client = await pool.connect();
-    await client.query('SELECT 1');
+    const db = await getDb();
+    await db.command({ ping: 1 });
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };
-  } finally {
-    try {
-      client?.release();
-    } catch {}
   }
+}
+
+export async function closeMongoDB() {
+  await client.close();
 }

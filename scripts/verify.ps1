@@ -15,7 +15,7 @@ function Check($name, [scriptblock]$block) {
 
 Check 'docker containers running' {
   $ps = docker ps --format '{{.Names}}' 2>$null
-  foreach ($c in @('teamchat-postgres', 'teamchat-redis', 'teamchat-server', 'teamchat-desktop')) {
+  foreach ($c in @('teamchat-mongo', 'teamchat-redis', 'teamchat-server', 'teamchat-desktop')) {
     if ($ps -notcontains $c) { throw "container $c not running (run: docker compose up -d --build)" }
   }
 }
@@ -23,7 +23,7 @@ Check 'docker containers running' {
 Check 'backend health ok' {
   $h = Invoke-RestMethod -Uri 'http://localhost:3000/health' -TimeoutSec 15
   if ($h.status -ne 'ok') { throw 'health status not ok - is Docker infra up?' }
-  if (-not $h.deps.postgres.ok) { throw 'postgres dep not ok' }
+  if (-not $h.deps.mongo.ok) { throw 'mongo dep not ok' }
   if (-not $h.deps.redis.ok) { throw 'redis dep not ok' }
 }
 

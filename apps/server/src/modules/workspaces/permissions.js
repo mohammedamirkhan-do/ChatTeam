@@ -1,34 +1,37 @@
-import { getOne, query } from '../../database/db.js';
+import { findOne } from '../../database/db.js';
 
-// Role hierarchy (higher = more power). Used to stop privilege escalation:
-// you can never grant a role at/above your own, and only owners touch owners.
 export const ROLE_RANK = Object.freeze({ guest: 0, bot: 0, member: 1, moderator: 2, admin: 3, owner: 4 });
 export const ROLES = Object.freeze(Object.keys(ROLE_RANK));
 
+const PERMISSION_MATRIX = Object.freeze({
+  owner: ['MANAGE_WORKSPACE', 'MANAGE_ROLES', 'INVITE_MEMBER', 'REMOVE_MEMBER', 'CREATE_CHANNEL', 'DELETE_CHANNEL', 'DELETE_MESSAGE', 'MANAGE_INTEGRATIONS', 'VIEW_AUDIT_LOG'],
+  admin: ['MANAGE_WORKSPACE', 'MANAGE_ROLES', 'INVITE_MEMBER', 'REMOVE_MEMBER', 'CREATE_CHANNEL', 'DELETE_CHANNEL', 'DELETE_MESSAGE', 'MANAGE_INTEGRATIONS', 'VIEW_AUDIT_LOG'],
+  moderator: ['INVITE_MEMBER', 'REMOVE_MEMBER', 'CREATE_CHANNEL', 'DELETE_MESSAGE', 'DELETE_CHANNEL', 'VIEW_AUDIT_LOG'],
+  member: ['INVITE_MEMBER', 'CREATE_CHANNEL'],
+  bot: ['INVITE_MEMBER', 'CREATE_CHANNEL'],
+  guest: [],
+});
+
 export async function hasPermission(workspaceId, userId, permission) {
-  const row = await getOne(
-    `SELECT 1 FROM workspace_members wm
-     JOIN role_permissions rp ON rp.role = wm.role
-     WHERE wm.workspace_id = $1 AND wm.user_id = $2 AND rp.permission = $3`,
-    [workspaceId, userId, permission]
-  );
-  return Boolean(row);
+  const wsMember = await findOne('workspace_members', { workspace_id: workspaceId, user_id: userId });
+  if (!wsMember) return false;
+  // Prefer DB-driven role_permissions when seeded, fall back to matrix.
+  try {
+    const rp = await findOne('role_permissions', { role: wsMember.role, permission });
+    if (rp) return true;
+  } catch {}
+  return (PERMISSION_MATRIX[wsMember.role] || []).includes(permission);
 }
 
-// Loads workspace + caller's membership. 404 if workspace missing,
-// 403 if caller is not a member. Attaches req.workspace / req.membership.
 export async function requireWorkspace(req, res, next) {
   try {
     const wid = req.params.wid || req.params.id;
-    if (!/^[0-9a-f-]{36}$/i.test(wid || '')) {
+    if (!/^[0-9a-f]{24}$/i.test(wid || '') && !/^[0-9a-f-]{36}$/i.test(wid || '')) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Workspace not found' } });
     }
-    const ws = await getOne('SELECT * FROM workspaces WHERE id = $1', [wid]);
+    const ws = await findOne('workspaces', { id: wid });
     if (!ws) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Workspace not found' } });
-    const membership = await getOne(
-      'SELECT * FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
-      [wid, req.user.id]
-    );
+    const membership = await findOne('workspace_members', { workspace_id: wid, user_id: req.user.id });
     if (!membership) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not a workspace member' } });
     req.workspace = ws;
     req.membership = membership;

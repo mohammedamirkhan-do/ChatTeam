@@ -5,7 +5,6 @@ import { io as ioClient } from 'socket.io-client';
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
-const { migrate } = await import('../src/database/migrate.js');
 const { createApp } = await import('../src/app.js');
 const { initRealtime } = await import('../src/websocket/index.js');
 
@@ -61,7 +60,6 @@ function waitFor(socket, type, ms = 5000) {
 }
 
 before(async () => {
-  await migrate();
   const app = createApp();
   httpServer = createServer(app);
   const { config } = await import('../src/config/index.js');
@@ -84,10 +82,10 @@ after(async () => {
   const { closeRealtime } = await import('../src/websocket/index.js');
   await closeRealtime();
   httpServer?.close();
-  const { pool } = await import('../src/database/pg.js');
+  const { closeMongoDB } = await import('../src/database/pg.js');
   const { redis } = await import('../src/database/redis.js');
   try { await redis.disconnect(); } catch {}
-  await pool.end();
+  await closeMongoDB();
 });
 
 test('B receives message.created live when A posts (<2s, Slack instant feel)', async () => {

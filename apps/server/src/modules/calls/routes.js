@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { query, getOne } from '../../database/db.js';
+import { findOne, insertOne, updateOne, aggregate } from '../../database/db.js';
 import { requireAuth } from '../../common/auth.js';
 import { requireWorkspace } from '../workspaces/permissions.js';
 import { publicCall, getCall, requireCall, callRoster } from './service.js';
@@ -16,7 +16,6 @@ function joinCallRoom(userIds, callId) {
   } catch {}
 }
 
-// POST /workspaces/:wid/calls {channelId|dmConversationId} — start/join live huddle.
 callsRouter.post('/workspaces/:wid/calls', requireAuth, requireWorkspace, async (req, res, next) => {
   try {
     const { channelId, dmConversationId } = validate(callCreateSchema, req.body);
@@ -25,34 +24,29 @@ callsRouter.post('/workspaces/:wid/calls', requireAuth, requireWorkspace, async 
     }
     let workspaceId = req.workspace.id;
     if (channelId) {
-      const ch = await getOne('SELECT * FROM channels WHERE id = $1 AND workspace_id = $2', [channelId, workspaceId]);
+      const ch = await findOne('channels', { id: channelId, workspace_id: workspaceId });
       if (!ch) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Channel not found' } });
       if (ch.is_private) {
-        const cm = await getOne('SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2', [channelId, req.user.id]);
+        const cm = await findOne('channel_members', { channel_id: channelId, user_id: req.user.id });
         if (!cm) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Private channel' } });
       }
     } else {
-      const dm = await getOne('SELECT * FROM direct_conversations WHERE id = $1 AND workspace_id = $2', [dmConversationId, workspaceId]);
+      const dm = await findOne('direct_conversations', { id: dmConversationId, workspace_id: workspaceId });
       if (!dm) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
-      const mem = await getOne('SELECT 1 FROM direct_conversation_members WHERE conversation_id = $1 AND user_id = $2', [dm.id, req.user.id]);
+      const mem = await findOne('direct_conversation_members', { conversation_id: dm.id, user_id: req.user.id });
       if (!mem) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not a conversation member' } });
     }
-    // Reuse a live call on the same conversation (Slack: one huddle per channel).
-    const existing = await getOne(
-      `SELECT * FROM calls WHERE workspace_id = $1 AND status = 'live'
-        AND ((channel_id IS NOT DISTINCT FROM $2) AND (dm_conversation_id IS NOT DISTINCT FROM $3))
-       ORDER BY created_at DESC LIMIT 1`,
-      [workspaceId, channelId, dmConversationId]
-    );
-    const call = existing || await getOne(
-      'INSERT INTO calls(workspace_id, channel_id, dm_conversation_id, created_by) VALUES ($1,$2,$3,$4) RETURNING *',
-      [workspaceId, channelId, dmConversationId, req.user.id]
-    );
-    await query(
-      `INSERT INTO call_participants(call_id, user_id) VALUES ($1,$2)
-       ON CONFLICT (call_id, user_id) DO UPDATE SET left_at = NULL`,
-      [call.id, req.user.id]
-    );
+    const existingFilter = channelId
+      ? { workspace_id: workspaceId, status: 'live', channel_id: channelId }
+      : { workspace_id: workspaceId, status: 'live', dm_conversation_id: dmConversationId };
+    const existing = await findOne('calls', existingFilter);
+    const call = existing || await insertOne('calls', { workspace_id: workspaceId, status: 'live', channel_id: channelId || null, dm_conversation_id: dmConversationId || null, created_by: req.user.id });
+    const part = await findOne('call_participants', { call_id: call.id, user_id: req.user.id });
+    if (part) {
+      await updateOne('call_participants', { call_id: call.id, user_id: req.user.id }, { $set: { left_at: null } });
+    } else {
+      await insertOne('call_participants', { call_id: call.id, user_id: req.user.id, left_at: null });
+    }
     const roster = await callRoster(call.id);
     joinCallRoom(roster.map((p) => p.userId), call.id);
     await publish({ type: 'call.started', payload: { call: publicCall(call), roster } }, [`workspace:${workspaceId}`]);
@@ -63,30 +57,26 @@ callsRouter.post('/workspaces/:wid/calls', requireAuth, requireWorkspace, async 
   }
 });
 
-// GET /calls/active?workspaceId= — live huddles I can see.
 callsRouter.get('/calls/active', requireAuth, async (req, res, next) => {
   try {
     const { workspaceId } = req.query;
     if (!workspaceId) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'workspaceId required' } });
-    const wsMember = await getOne('SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [workspaceId, req.user.id]);
+    const wsMember = await findOne('workspace_members', { workspace_id: workspaceId, user_id: req.user.id });
     if (!wsMember) return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not a workspace member' } });
-    const r = await query(
-      `SELECT c.* FROM calls c WHERE c.workspace_id = $1 AND c.status = 'live'
-        AND ((c.channel_id IS NULL) OR (SELECT NOT is_private FROM channels WHERE id = c.channel_id)
-             OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.channel_id AND cm.user_id = $2))
-        AND ((c.dm_conversation_id IS NULL) OR EXISTS (SELECT 1 FROM direct_conversation_members dcm WHERE dcm.conversation_id = c.dm_conversation_id AND dcm.user_id = $2))
-       ORDER BY c.created_at DESC`,
-      [workspaceId, req.user.id]
-    );
+    const r = await aggregate('calls', [
+      { $match: { workspace_id: workspaceId, status: 'live' } },
+      { $lookup: { from: 'channels', localField: 'channel_id', foreignField: '_id', as: 'channel' } },
+      { $unwind: { path: '$channel', preserveNullAndEmptyArrays: true } },
+      { $match: { $or: [{ channel_id: null }, { 'channel.is_private': false }, { 'channel.is_private': { $exists: false } }] } }
+    ]);
     const out = [];
-    for (const row of r.rows) out.push({ ...publicCall(row), participants: await callRoster(row.id) });
+    for (const row of r) out.push({ ...publicCall(row), participants: await callRoster(row.id) });
     res.json({ calls: out });
   } catch (e) {
     next(e);
   }
 });
 
-// GET /calls/:id — roster included.
 callsRouter.get('/calls/:id', requireAuth, requireCall, async (req, res, next) => {
   try {
     res.json({ call: { ...publicCall(req.call), participants: await callRoster(req.call.id) } });
@@ -95,18 +85,16 @@ callsRouter.get('/calls/:id', requireAuth, requireCall, async (req, res, next) =
   }
 });
 
-// POST /calls/:id/media {muted,cameraOff,sharing} — roster state.
 callsRouter.post('/calls/:id/media', requireAuth, requireCall, async (req, res, next) => {
   try {
     if (req.call.status !== 'live') return res.status(400).json({ error: { code: 'ENDED', message: 'Call has ended' } });
     const patch = validate(callMediaSchema, req.body);
-    const sets = [];
-    const params = [req.call.id, req.user.id];
-    if (patch.muted !== undefined) { params.push(patch.muted); sets.push(`muted = $${params.length}`); }
-    if (patch.cameraOff !== undefined) { params.push(patch.cameraOff); sets.push(`camera_off = $${params.length}`); }
-    if (patch.sharing !== undefined) { params.push(patch.sharing); sets.push(`sharing = $${params.length}`); }
-    if (sets.length) {
-      await query(`UPDATE call_participants SET ${sets.join(', ')} WHERE call_id = $1 AND user_id = $2 AND left_at IS NULL`, params);
+    const sets = {};
+    if (patch.muted !== undefined) sets.muted = patch.muted;
+    if (patch.cameraOff !== undefined) sets.camera_off = patch.cameraOff;
+    if (patch.sharing !== undefined) sets.sharing = patch.sharing;
+    if (Object.keys(sets).length) {
+      await updateOne('call_participants', { call_id: req.call.id, user_id: req.user.id, left_at: null }, { $set: sets });
     }
     const roster = await callRoster(req.call.id);
     await publish({ type: 'call.media', payload: { callId: req.call.id, userId: req.user.id, roster } }, [`call:${req.call.id}`]);
@@ -116,14 +104,13 @@ callsRouter.post('/calls/:id/media', requireAuth, requireCall, async (req, res, 
   }
 });
 
-// POST /calls/:id/leave — leave; last one out ends the call (Slack huddle).
 callsRouter.post('/calls/:id/leave', requireAuth, requireCall, async (req, res, next) => {
   try {
-    await query('UPDATE call_participants SET left_at = now() WHERE call_id = $1 AND user_id = $2 AND left_at IS NULL', [req.call.id, req.user.id]);
+    await updateOne('call_participants', { call_id: req.call.id, user_id: req.user.id, left_at: null }, { $set: { left_at: new Date() } });
     const roster = await callRoster(req.call.id);
     await publish({ type: 'call.left', payload: { callId: req.call.id, userId: req.user.id, roster } }, [`call:${req.call.id}`]);
     if (!roster.length && req.call.status === 'live') {
-      await query(`UPDATE calls SET status = 'ended', ended_at = now() WHERE id = $1`, [req.call.id]);
+      await updateOne('calls', { id: req.call.id }, { $set: { status: 'ended', ended_at: new Date() } });
       await publish({ type: 'call.ended', payload: { callId: req.call.id } }, [`workspace:${req.call.workspace_id}`]);
     }
     res.json({ ok: true, participants: roster });
@@ -132,13 +119,12 @@ callsRouter.post('/calls/:id/leave', requireAuth, requireCall, async (req, res, 
   }
 });
 
-// POST /calls/:id/end — creator ends for everyone.
 callsRouter.post('/calls/:id/end', requireAuth, requireCall, async (req, res, next) => {
   try {
     if (req.call.created_by !== req.user.id) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Only the starter can end the call' } });
     }
-    await query(`UPDATE calls SET status = 'ended', ended_at = now() WHERE id = $1`, [req.call.id]);
+    await updateOne('calls', { id: req.call.id }, { $set: { status: 'ended', ended_at: new Date() } });
     await publish({ type: 'call.ended', payload: { callId: req.call.id } }, [`call:${req.call.id}`, `workspace:${req.call.workspace_id}`]);
     res.json({ ok: true });
   } catch (e) {
